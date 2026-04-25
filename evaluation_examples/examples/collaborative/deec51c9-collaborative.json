@@ -1,0 +1,101 @@
+{
+  "id": "deec51c9-collaborative",
+  "osworld_original": "deec51c9-3b1e-4b9e-993c-4776f20e8bb2",
+  "snapshot": "google_sheets",
+  "instruction": "Find a paper list of all the new foundation language models issued on 11st Oct. 2023 via arxiv daily, and organize it into this Google Sheet: {SHEET_URL}.",
+  "source": "authors",
+  "config": [
+    {
+      "type": "google_sheet_from_template",
+      "parameters": {
+        "template_url": "https://huggingface.co/datasets/xlangai/ubuntu_osworld_file_cache/resolve/main/multi_apps/deec51c9-3b1e-4b9e-993c-4776f20e8bb2/New%20Large%20Language%20Models.xlsx",
+        "placeholder": "{SHEET_URL}",
+        "title": "New Large Language Models Oct 11 2023",
+        "client_secret_path": "oauth_client_secret.json",
+        "token_path": "oauth_token.pickle",
+        "open_in_chrome": true
+      }
+    },
+    {
+      "type": "launch",
+      "parameters": {
+        "command": [
+          "google-chrome",
+          "--remote-debugging-port=1337"
+        ]
+      }
+    },
+    {
+      "type": "launch",
+      "parameters": {
+        "command": [
+          "socat",
+          "tcp-listen:9222,fork",
+          "tcp:localhost:1337"
+        ]
+      }
+    },
+    {
+      "type": "chrome_open_tabs",
+      "parameters": {
+        "urls_to_open": []
+      }
+    }
+  ],
+  "trajectory": "trajectories/deec51c9-3b1e-4b9e-993c-4776f20e8bb2",
+  "related_apps": [
+    "chrome",
+    "google_sheets",
+    "os"
+  ],
+  "evaluator": {
+    "postconfig": [
+      {
+        "type": "sleep",
+        "parameters": {
+          "seconds": 2.0
+        }
+      }
+    ],
+    "func": "compare_table",
+    "result": {
+      "type": "google_sheet",
+      "sheet_id": "PLACEHOLDER",
+      "dest": "New Large Language Models.xlsx"
+    },
+    "expected": {
+      "type": "cloud_file",
+      "path": "https://huggingface.co/datasets/xlangai/ubuntu_osworld_file_cache/resolve/main/multi_apps/deec51c9-3b1e-4b9e-993c-4776f20e8bb2/New%20Large%20Language%20Models%20Gold.xlsx",
+      "dest": "New Large Language Models Gold.xlsx"
+    },
+    "options": {
+      "rules": [
+        {
+          "type": "sheet_fuzzy",
+          "sheet_idx0": "RNSheet1",
+          "sheet_idx1": "ENSheet1",
+          "rules": [
+            {
+              "range": [
+                "B2:B5",
+                "C2:C5"
+              ],
+              "type": "exact_match"
+            },
+            {
+              "range": [
+                "A2:A5"
+              ],
+              "type": "fuzzy_match",
+              "threshold": 90,
+              "ignore_case": true
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "proxy": false,
+  "fixed_ip": false,
+  "possibility_of_env_change": "low"
+}

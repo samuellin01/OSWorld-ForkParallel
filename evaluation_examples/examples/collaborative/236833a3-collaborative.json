@@ -1,0 +1,81 @@
+{
+  "id": "236833a3-collaborative",
+  "osworld_original": "236833a3-5704-47fc-888c-4f298f09f799",
+  "snapshot": "chrome",
+  "instruction": "Find the daily paper list on Huggingface and take down the meta information of papers on 1st March, 2024 in the Google Doc at {DOC_URL}. I have recorded two papers. Please conform to the format and complete others.",
+  "source": "authors",
+  "config": [
+    {
+      "type": "launch",
+      "parameters": {
+        "command": [
+          "google-chrome",
+          "--remote-debugging-port=1337"
+        ]
+      }
+    },
+    {
+      "type": "launch",
+      "parameters": {
+        "command": [
+          "socat",
+          "tcp-listen:9222,fork",
+          "tcp:localhost:1337"
+        ]
+      }
+    },
+    {
+      "type": "chrome_open_tabs",
+      "parameters": {
+        "urls_to_open": [
+          "https://huggingface.co/"
+        ]
+      }
+    },
+    {
+      "type": "google_doc_from_template",
+      "parameters": {
+        "template_url": "https://huggingface.co/datasets/xlangai/ubuntu_osworld_file_cache/resolve/main/multi_apps/236833a3-5704-47fc-888c-4f298f09f799/raw_paper_reading_2024_03_01.docx",
+        "placeholder": "{DOC_URL}",
+        "title": "Paper Reading 2024-03-01",
+        "client_secret_path": "oauth_client_secret.json",
+        "token_path": "oauth_token.pickle",
+        "open_in_chrome": true
+      }
+    }
+  ],
+  "trajectory": "trajectories/",
+  "related_apps": [
+    "chrome",
+    "google_docs"
+  ],
+  "evaluator": {
+    "postconfig": [
+      {
+        "type": "sleep",
+        "parameters": {
+          "seconds": 2.0
+        }
+      }
+    ],
+    "func": "compare_docx_files",
+    "result": {
+      "type": "google_doc",
+      "doc_id": "PLACEHOLDER",
+      "dest": "paper_reading_2024_03_01.docx"
+    },
+    "expected": {
+      "type": "cloud_file",
+      "path": "https://huggingface.co/datasets/xlangai/ubuntu_osworld_file_cache/resolve/main/multi_apps/236833a3-5704-47fc-888c-4f298f09f799/paper_reading_2024_03_01.docx",
+      "dest": "gold_paper_reading_2024_03_01.docx"
+    },
+    "options": {
+      "ignore_blanks": true,
+      "ignore_case": true,
+      "ignore_order": true
+    }
+  },
+  "proxy": true,
+  "fixed_ip": false,
+  "possibility_of_env_change": "low"
+}

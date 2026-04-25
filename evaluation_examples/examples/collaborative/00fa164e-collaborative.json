@@ -1,0 +1,96 @@
+{
+  "id": "00fa164e-collaborative",
+  "osworld_original": "00fa164e-2612-4439-992e-157d019a8436",
+  "snapshot": "google_docs",
+  "instruction": "I need to include the experiment results from the Google Sheet at {SHEET_URL} into the currently writing report at {DOC_URL}. Specifically, extract the results of GPT-4 and insert a table into the \"Main Results\" section of my report. Remember to paste the table header, too.",
+  "source": "authors",
+  "config": [
+    {
+      "type": "command",
+      "parameters": {
+        "command": [
+          "mkdir",
+          "-p",
+          "/home/user/Documents/awesome-desktop/"
+        ]
+      }
+    },
+    {
+      "type": "google_sheet_from_template",
+      "parameters": {
+        "template_url": "https://huggingface.co/datasets/xlangai/ubuntu_osworld_file_cache/resolve/main/multi_apps/00fa164e-2612-4439-992e-157d019a8436/results.xlsx",
+        "placeholder": "{SHEET_URL}",
+        "title": "Experiment Results",
+        "client_secret_path": "oauth_client_secret.json",
+        "token_path": "oauth_token.pickle",
+        "open_in_chrome": false
+      }
+    },
+    {
+      "type": "google_doc_from_template",
+      "parameters": {
+        "template_url": "https://huggingface.co/datasets/xlangai/ubuntu_osworld_file_cache/resolve/main/multi_apps/00fa164e-2612-4439-992e-157d019a8436/awe_desk_env.docx",
+        "placeholder": "{DOC_URL}",
+        "title": "AWE Desktop Environment Report",
+        "client_secret_path": "oauth_client_secret.json",
+        "token_path": "oauth_token.pickle",
+        "open_in_chrome": true
+      }
+    },
+    {
+      "type": "launch",
+      "parameters": {
+        "command": [
+          "google-chrome",
+          "--remote-debugging-port=1337"
+        ]
+      }
+    },
+    {
+      "type": "launch",
+      "parameters": {
+        "command": [
+          "socat",
+          "tcp-listen:9222,fork",
+          "tcp:localhost:1337"
+        ]
+      }
+    },
+    {
+      "type": "chrome_open_tabs",
+      "parameters": {
+        "urls_to_open": []
+      }
+    }
+  ],
+  "trajectory": "trajectories/00fa164e-2612-4439-992e-157d019a8436",
+  "related_apps": [
+    "chrome",
+    "google_docs",
+    "google_sheets"
+  ],
+  "evaluator": {
+    "postconfig": [
+      {
+        "type": "sleep",
+        "parameters": {
+          "seconds": 2.0
+        }
+      }
+    ],
+    "func": "compare_docx_tables",
+    "result": {
+      "type": "google_doc",
+      "doc_id": "PLACEHOLDER",
+      "dest": "awe_desk_env.docx"
+    },
+    "expected": {
+      "type": "cloud_file",
+      "path": "https://huggingface.co/datasets/xlangai/ubuntu_osworld_file_cache/resolve/main/multi_apps/00fa164e-2612-4439-992e-157d019a8436/awe_desk_env_gt.docx",
+      "dest": "awe_desk_env_gt.docx"
+    }
+  },
+  "proxy": false,
+  "fixed_ip": false,
+  "possibility_of_env_change": "low"
+}

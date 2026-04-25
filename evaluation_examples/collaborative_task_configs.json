@@ -1,0 +1,253 @@
+{
+  "tasks": {
+    "67890eb6-collaborative": {
+      "name": "acl_papers_2019_2022",
+      "osworld_original": "67890eb6-6ce5-4c00-9e3d-fb4972699b06",
+      "config_file": "tasks/67890eb6-collaborative.json",
+      "type": "google_sheet",
+      "status": "active",
+      "baseline_time_seconds": 477,
+      "description": "Research ACL best paper awards 2019-2022, record in Google Sheet"
+    },
+    "6f4073b8-collaborative": {
+      "name": "conference_cities_2013_2019",
+      "osworld_original": "6f4073b8-d8ea-4ade-8a18-c5d1d5d5aa9a",
+      "config_file": "tasks/6f4073b8-collaborative.json",
+      "type": "google_sheet",
+      "status": "active",
+      "baseline_time_seconds": null,
+      "description": "Research meeting cities for ICLR/ICML/NeurIPS 2013-2019, fill Google Sheet"
+    },
+    "c7c1e4c3-collaborative": {
+      "name": "professor_contact_info",
+      "osworld_original": "c7c1e4c3-9e92-4eba-a4b8-689953975ea4",
+      "config_file": "tasks/c7c1e4c3-collaborative.json",
+      "type": "google_sheet",
+      "status": "active",
+      "baseline_time_seconds": null,
+      "description": "Extract professor email addresses from homepages, fill Google Sheet"
+    },
+    "d1acdb87-collaborative": {
+      "name": "hongkong_restaurants",
+      "osworld_original": "d1acdb87-bb67-4f30-84aa-990e56a09c92",
+      "config_file": "tasks/d1acdb87-collaborative.json",
+      "type": "google_sheet",
+      "status": "active",
+      "baseline_time_seconds": null,
+      "description": "Look up Hong Kong restaurant details on Google Maps, fill Google Sheet"
+    },
+    "deec51c9-collaborative": {
+      "name": "arxiv_llm_papers_oct11_2023",
+      "osworld_original": "deec51c9-3b1e-4b9e-993c-4776f20e8bb2",
+      "config_file": "tasks/deec51c9-collaborative.json",
+      "type": "google_sheet",
+      "status": "active",
+      "baseline_time_seconds": null,
+      "description": "Find foundation LLM papers from ArXiv daily Oct 11 2023, organize in Google Sheet"
+    },
+    "3e3fc409-collaborative": {
+      "name": "imdb_unseen_movies",
+      "osworld_original": "3e3fc409-bff3-4905-bf16-c968eee3f807",
+      "config_file": "tasks/3e3fc409-collaborative.json",
+      "type": "google_sheet",
+      "status": "active",
+      "baseline_time_seconds": null,
+      "description": "Find unseen movies from IMDB Top 30, create sheet in Google Sheets"
+    },
+    "da52d699-collaborative": {
+      "name": "books_reading_pace",
+      "osworld_original": "da52d699-e8d2-4dc5-9191-a2199e0b6a9b",
+      "config_file": "tasks/da52d699-collaborative.json",
+      "type": "google_sheet",
+      "status": "active",
+      "baseline_time_seconds": null,
+      "description": "Find book with slowest reading pace from Google Sheet, write result to docx"
+    },
+    "68a25bd4-collaborative": {
+      "name": "papers_books_collection",
+      "osworld_original": "68a25bd4-e36c-4ab8-9631-1f4fcf59fcf7",
+      "config_file": "tasks/68a25bd4-collaborative.json",
+      "type": "google_sheet",
+      "status": "active",
+      "baseline_time_seconds": null,
+      "description": "Download papers and books PDFs from URLs in Google Sheet"
+    },
+    "5990457f-collaborative": {
+      "name": "researchers_database",
+      "osworld_original": "5990457f-9f8e-46a1-8c7c-ef4e5b57ab31",
+      "config_file": "tasks/5990457f-collaborative.json",
+      "type": "google_sheet",
+      "status": "active",
+      "baseline_time_seconds": null,
+      "description": "Append researcher Yann LeCun to Google Sheet with citations and h-index"
+    },
+    "185f29bd-collaborative": {
+      "name": "employee_performance",
+      "osworld_original": "185f29bd-8b1e-45d1-9f41-4050c109aaa5",
+      "config_file": "tasks/185f29bd-collaborative.json",
+      "type": "google_sheet",
+      "status": "active",
+      "baseline_time_seconds": null,
+      "description": "Calculate average scores for employee performance evaluations in Google Sheet"
+    },
+    "30e3e107-collaborative": {
+      "name": "demographic_profile",
+      "osworld_original": "30e3e107-1cfb-46ee-a755-2cd080d7ba6a",
+      "config_file": "tasks/30e3e107-collaborative.json",
+      "type": "google_sheet",
+      "status": "active",
+      "baseline_time_seconds": null,
+      "description": "Create demographic profile sheet in Google Sheets with age groups and percentages"
+    },
+    "0326d92d-collaborative": {
+      "name": "sales_analysis",
+      "osworld_original": "0326d92d-d218-48a8-9ca1-981cd6d064c7",
+      "config_file": "tasks/0326d92d-collaborative.json",
+      "type": "google_sheet",
+      "status": "active",
+      "baseline_time_seconds": null,
+      "description": "Calculate monthly sales totals in Google Sheet"
+    },
+    "1e8df695-collaborative": {
+      "name": "weekly_sales_profit",
+      "osworld_original": "1e8df695-bd1b-45b3-b557-e7d599cf7597",
+      "config_file": "tasks/1e8df695-collaborative.json",
+      "type": "google_sheet",
+      "status": "active",
+      "baseline_time_seconds": null,
+      "description": "Calculate profit column (Revenue - Cost) in Google Sheet"
+    },
+    "1954cced-collaborative": {
+      "name": "invoice_pivot_table",
+      "osworld_original": "1954cced-e748-45c4-9c26-9855b97fbc5e",
+      "config_file": "tasks/1954cced-collaborative.json",
+      "type": "google_sheet",
+      "status": "active",
+      "baseline_time_seconds": null,
+      "description": "Create pivot table counting Invoice No. occurrences in Google Sheets"
+    },
+    "1273e544-collaborative": {
+      "name": "copy_revenue_column",
+      "osworld_original": "1273e544-688f-496b-8d89-3e0f40aa0606",
+      "config_file": "tasks/1273e544-collaborative.json",
+      "type": "google_sheet",
+      "status": "active",
+      "baseline_time_seconds": null,
+      "description": "Copy Revenue column with header to new sheet in Google Sheets"
+    },
+    "035f41ba-collaborative": {
+      "name": "gross_profit_calculation",
+      "osworld_original": "035f41ba-6653-43ab-aa63-c86d449d62e5",
+      "config_file": "tasks/035f41ba-collaborative.json",
+      "type": "google_sheet",
+      "status": "active",
+      "baseline_time_seconds": null,
+      "description": "Calculate gross profit and create Year_Profit concatenation in Google Sheets"
+    },
+    "01b269ae-collaborative": {
+      "name": "fill_blank_cells",
+      "osworld_original": "01b269ae-2111-4a07-81fd-3fcd711993b0",
+      "config_file": "tasks/01b269ae-collaborative.json",
+      "type": "google_sheet",
+      "status": "active",
+      "baseline_time_seconds": null,
+      "description": "Fill blank cells in B1:E30 with values from cell above in Google Sheets"
+    },
+    "00fa164e-collaborative": {
+      "name": "excel_to_writer_table",
+      "osworld_original": "00fa164e-2612-4439-992e-157d019a8436",
+      "config_file": "tasks/00fa164e-collaborative.json",
+      "type": "multi_app",
+      "status": "active",
+      "baseline_time_seconds": null,
+      "description": "Extract GPT-4 results from Google Sheet and insert table into Google Doc report"
+    },
+    "09a37c51-collaborative": {
+      "name": "image_editing_from_doc",
+      "osworld_original": "09a37c51-e625-49f4-a514-20a773797a8a",
+      "config_file": "tasks/09a37c51-collaborative.json",
+      "type": "multi_app",
+      "status": "active",
+      "baseline_time_seconds": null,
+      "description": "Edit image with GIMP based on requirements in Google Doc"
+    },
+    "0e5303d4-collaborative": {
+      "name": "download_course_pdfs",
+      "osworld_original": "0e5303d4-8820-42f6-b18d-daf7e633de21",
+      "config_file": "tasks/0e5303d4-collaborative.json",
+      "type": "multi_app",
+      "status": "active",
+      "baseline_time_seconds": null,
+      "description": "Download CS50 Python course lecture PDFs from website"
+    },
+    "1f18aa87-collaborative": {
+      "name": "grammar_test_answers",
+      "osworld_original": "1f18aa87-af6f-41ef-9853-cdb8f32ebdea",
+      "config_file": "tasks/1f18aa87-collaborative.json",
+      "type": "multi_app",
+      "status": "active",
+      "baseline_time_seconds": null,
+      "description": "Write grammar test answers in Google Doc following format from Test 1"
+    },
+    "20236825-collaborative": {
+      "name": "bubble_sort_coding",
+      "osworld_original": "20236825-b5df-46e7-89bf-62e1d640a897",
+      "config_file": "tasks/20236825-collaborative.json",
+      "type": "multi_app",
+      "status": "active",
+      "baseline_time_seconds": null,
+      "description": "Implement bubbleSort function based on Google Doc tutorial"
+    },
+    "236833a3-collaborative": {
+      "name": "huggingface_papers_scraping",
+      "osworld_original": "236833a3-5704-47fc-888c-4f298f09f799",
+      "config_file": "tasks/236833a3-collaborative.json",
+      "type": "multi_app",
+      "status": "active",
+      "baseline_time_seconds": null,
+      "description": "Scrape paper metadata from Huggingface and record in Google Doc"
+    },
+    "26150609-collaborative": {
+      "name": "debug_snake_game",
+      "osworld_original": "26150609-0da3-4a7d-8868-0faf9c5f01bb",
+      "config_file": "tasks/26150609-collaborative.json",
+      "type": "multi_app",
+      "status": "active",
+      "baseline_time_seconds": null,
+      "description": "Debug Python Snake game to fix food eating functionality"
+    },
+    "337d318b-collaborative": {
+      "name": "invoice_reconciliation",
+      "osworld_original": "337d318b-aa07-4f4f-b763-89d9a2dd013f",
+      "config_file": "tasks/337d318b-collaborative.json",
+      "type": "multi_app",
+      "status": "active",
+      "baseline_time_seconds": null,
+      "description": "Cross-check invoices with bank statements and organize problematic PDFs"
+    },
+    "2fe4b718-collaborative": {
+      "name": "video_to_gif",
+      "osworld_original": "2fe4b718-3bd7-46ec-bdce-b184f5653624",
+      "config_file": "tasks/2fe4b718-collaborative.json",
+      "type": "multi_app",
+      "status": "active",
+      "baseline_time_seconds": null,
+      "description": "Create animated GIF from video clip using VLC and GIMP"
+    },
+    "3c8f201a-collaborative": {
+      "name": "image_compression",
+      "osworld_original": "3c8f201a-009d-4bbe-8b65-a6f8b35bb57f",
+      "config_file": "tasks/3c8f201a-collaborative.json",
+      "type": "multi_app",
+      "status": "active",
+      "baseline_time_seconds": null,
+      "description": "Download and compress image to under 600KB using GIMP"
+    }
+  },
+  "metadata": {
+    "version": "1.0",
+    "created": "2026-04-23",
+    "updated": "2026-04-24",
+    "total_tasks": 27
+  }
+}

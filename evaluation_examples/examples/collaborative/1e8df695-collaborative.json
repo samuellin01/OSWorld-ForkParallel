@@ -1,0 +1,106 @@
+{
+  "id": "1e8df695-collaborative",
+  "osworld_original": "1e8df695-bd1b-45b3-b557-e7d599cf7597",
+  "snapshot": "google_sheets",
+  "instruction": "Add a new column named \"Profit\" right next to the 'CGOS' column and calculate the profit for each week by subtracting \"COGS\" from \"Sales\" in that column.",
+  "source": "SheetCopilot@203",
+  "config": [
+    {
+      "type": "google_sheet_from_template",
+      "parameters": {
+        "template_url": "https://huggingface.co/datasets/xlangai/ubuntu_osworld_file_cache/resolve/main/libreoffice_calc/1e8df695-bd1b-45b3-b557-e7d599cf7597/WeeklySales.xlsx",
+        "placeholder": "{SHEET_URL}",
+        "title": "Weekly Sales Profit",
+        "client_secret_path": "oauth_client_secret.json",
+        "token_path": "oauth_token.pickle",
+        "open_in_chrome": true
+      }
+    },
+    {
+      "type": "launch",
+      "parameters": {
+        "command": [
+          "google-chrome",
+          "--remote-debugging-port=1337"
+        ]
+      }
+    },
+    {
+      "type": "launch",
+      "parameters": {
+        "command": [
+          "socat",
+          "tcp-listen:9222,fork",
+          "tcp:localhost:1337"
+        ]
+      }
+    },
+    {
+      "type": "chrome_open_tabs",
+      "parameters": {
+        "urls_to_open": []
+      }
+    }
+  ],
+  "trajectory": "trajectories/1e8df695-bd1b-45b3-b557-e7d599cf7597",
+  "related_apps": [
+    "chrome",
+    "google_sheets"
+  ],
+  "proxy": false,
+  "fixed_ip": false,
+  "possibility_of_env_change": "low",
+  "evaluator": {
+    "postconfig": [
+      {
+        "type": "activate_window",
+        "parameters": {
+          "window_name": "WeeklySales.xlsx - LibreOffice Calc",
+          "strict": true
+        }
+      },
+      {
+        "type": "sleep",
+        "parameters": {
+          "seconds": 0.5
+        }
+      },
+      {
+        "type": "execute",
+        "parameters": {
+          "command": [
+            "python",
+            "-c",
+            "import pyautogui; pyautogui.hotkey(\"ctrl\", \"s\");"
+          ]
+        }
+      },
+      {
+        "type": "sleep",
+        "parameters": {
+          "seconds": 0.5
+        }
+      }
+    ],
+    "func": "compare_table",
+    "expected": {
+      "type": "cloud_file",
+      "path": "https://huggingface.co/datasets/xlangai/ubuntu_osworld_file_cache/resolve/main/libreoffice_calc/1e8df695-bd1b-45b3-b557-e7d599cf7597/6_WeeklySales_gt1.xlsx",
+      "dest": "6_WeeklySales_gt1.xlsx"
+    },
+    "result": {
+      "type": "google_sheet",
+      "sheet_id": "PLACEHOLDER",
+      "dest": "WeeklySales.xlsx"
+    },
+    "options": {
+      "rules": [
+        {
+          "type": "sheet_data",
+          "sheet_idx0": 0,
+          "sheet_idx1": "EI0"
+        }
+      ]
+    }
+  }
+}

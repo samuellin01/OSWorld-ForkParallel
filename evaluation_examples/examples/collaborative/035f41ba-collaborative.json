@@ -1,0 +1,88 @@
+{
+  "id": "035f41ba-collaborative",
+  "osworld_original": "035f41ba-6653-43ab-aa63-c86d449d62e5",
+  "snapshot": "google_sheets",
+  "instruction": "Help me fill in the Gross profit column by subtracting all the available expenses including discounts, allowances, material and labor charges, and overhead from the actual sale, i.e., the sales after deducting the returns, in this Google Sheet: {SHEET_URL}. Then under column A named \"Year_Profit\" in a new sheet \"Sheet2\", display the Year Column in Sheet 1 as text appended by a \"_\" with the corresponding integer digits of Gross Profit value.",
+  "source": "SheetCopilot@92",
+  "config": [
+    {
+      "type": "google_sheet_from_template",
+      "parameters": {
+        "template_url": "https://huggingface.co/datasets/xlangai/ubuntu_osworld_file_cache/resolve/main/libreoffice_calc/035f41ba-6653-43ab-aa63-c86d449d62e5/IncomeStatement2.xlsx",
+        "placeholder": "{SHEET_URL}",
+        "title": "Income Statement",
+        "client_secret_path": "oauth_client_secret.json",
+        "token_path": "oauth_token.pickle",
+        "open_in_chrome": true
+      }
+    },
+    {
+      "type": "launch",
+      "parameters": {
+        "command": [
+          "google-chrome",
+          "--remote-debugging-port=1337"
+        ]
+      }
+    },
+    {
+      "type": "launch",
+      "parameters": {
+        "command": [
+          "socat",
+          "tcp-listen:9222,fork",
+          "tcp:localhost:1337"
+        ]
+      }
+    },
+    {
+      "type": "chrome_open_tabs",
+      "parameters": {
+        "urls_to_open": []
+      }
+    }
+  ],
+  "trajectory": "trajectories/035f41ba-6653-43ab-aa63-c86d449d62e5",
+  "related_apps": [
+    "chrome",
+    "google_sheets"
+  ],
+  "evaluator": {
+    "postconfig": [
+      {
+        "type": "sleep",
+        "parameters": {
+          "seconds": 2.0
+        }
+      }
+    ],
+    "func": "compare_table",
+    "result": {
+      "type": "google_sheet",
+      "sheet_id": "PLACEHOLDER",
+      "dest": "IncomeStatement2.xlsx"
+    },
+    "expected": {
+      "type": "cloud_file",
+      "path": "https://huggingface.co/datasets/xlangai/ubuntu_osworld_file_cache/resolve/main/libreoffice_calc/035f41ba-6653-43ab-aa63-c86d449d62e5/5_IncomeStatement2_gt1.xlsx",
+      "dest": "5_IncomeStatement2_gt1.xlsx"
+    },
+    "options": {
+      "rules": [
+        {
+          "type": "sheet_data",
+          "sheet_idx0": "RNSheet1",
+          "sheet_idx1": "ENSheet1"
+        },
+        {
+          "type": "sheet_data",
+          "sheet_idx0": "RNSheet2",
+          "sheet_idx1": "ENSheet2"
+        }
+      ]
+    }
+  },
+  "proxy": false,
+  "fixed_ip": false,
+  "possibility_of_env_change": "low"
+}
