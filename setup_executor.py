@@ -130,11 +130,13 @@ class SetupExecutor:
                 time.sleep(0.5)
         else:
             # Launch Chrome with URLs
-            logger.info(f"Launching Chrome with {len(urls)} URL(s)")
+            # Use display-specific debugging port to avoid conflicts (1337 + display_num)
+            debug_port = 1337 + self.display_num
+            logger.info(f"Launching Chrome with {len(urls)} URL(s) on debug port {debug_port}")
             url_args = " ".join([f"'{url}'" for url in urls])
             cmd = (
                 f"{self.display_env} nohup google-chrome "
-                f"--remote-debugging-port=1337 {url_args} "
+                f"--remote-debugging-port={debug_port} {url_args} "
                 f">/dev/null 2>&1 &"
             )
             result = self.vm_exec(cmd)
@@ -250,7 +252,7 @@ class SetupExecutor:
         """Activate (focus) a window by name.
 
         Args:
-            params: {"window_name": "Window Title", "strict": bool}
+            params: {"window_name": "Window Title", "strict": bool, "required": bool}
         """
         window_name = params.get("window_name")
         if not window_name:
@@ -258,6 +260,7 @@ class SetupExecutor:
             return True
 
         strict = params.get("strict", False)
+        required = params.get("required", False)  # If False, don't fail config on error
         match_flag = "-e" if strict else "-i"  # exact match or case-insensitive
 
         cmd = f"{self.display_env} wmctrl {match_flag} -a '{window_name}'"
@@ -267,6 +270,8 @@ class SetupExecutor:
         success = result is not None and result.get("returncode") == 0
         if not success:
             logger.warning(f"Could not activate window '{window_name}'")
+            # If not required, treat as success (best effort)
+            return success if required else True
 
         return success
 
