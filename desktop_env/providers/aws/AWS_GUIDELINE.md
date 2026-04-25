@@ -97,7 +97,7 @@ Enter your credentials as required. This setup will allow you to interact with A
 If you use one AWS account for Bedrock (Claude LLM) and a different account for OSWorld VMs, set the `OSWORLD_AWS_*` prefixed variables for the VM account:
 
 ```bash
-# Bedrock / Claude (standard AWS_* vars — used by Confucius agent)
+# Bedrock / Claude (standard AWS_* vars)
 export AWS_REGION=us-west-2
 export AWS_ACCESS_KEY_ID="AKIA...BEDROCK"
 export AWS_SECRET_ACCESS_KEY="...bedrock-secret..."

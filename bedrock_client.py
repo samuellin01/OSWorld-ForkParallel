@@ -1,10 +1,10 @@
 """Thin synchronous wrapper for AWS Bedrock (Anthropic Messages API).
 
-This module is completely standalone — it does NOT import from confucius.
+This module is completely standalone.
 It uses the AnthropicBedrock SDK (from the ``anthropic`` package) with
 ``client.beta.messages.create()`` and ``betas=["computer-use-2025-11-24"]``
 when computer-use tools are present, matching the pattern used by the
-confucius agent in ``mm_agents/anthropic/utils.py``.
+agent in ``mm_agents/anthropic/utils.py``.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from anthropic import AnthropicBedrock
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Model ID map — copied from confucius/core/chat_models/bedrock/model_id.py
+# Model ID map
 # ---------------------------------------------------------------------------
 MODEL_ID_MAP: Dict[str, str] = {
     # Claude 3.5 variants
@@ -239,8 +239,7 @@ class BedrockClient:
     """Synchronous Bedrock client using the AnthropicBedrock SDK.
 
     Uses ``client.beta.messages.create()`` with
-    ``betas=["computer-use-2025-11-24"]`` when computer-use tools are present,
-    matching the pattern used by the confucius agent.
+    ``betas=["computer-use-2025-11-24"]`` when computer-use tools are present.
     """
 
     def __init__(self, region: Optional[str] = None, log_dir: Optional[str] = None) -> None:

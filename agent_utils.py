@@ -119,7 +119,7 @@ def parse_computer_use_actions(
 ) -> List[str]:
     """Convert computer-use ``tool_use`` content blocks into pyautogui action strings.
 
-    Adapted from ``confucius/analects/osworld/agent.py``.  Operates on the
+    Operates on the
     list of content-block dicts returned by the Bedrock API.
 
     Parameters

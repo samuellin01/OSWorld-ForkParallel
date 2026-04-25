@@ -15,7 +15,6 @@ classifiers = [
   "License :: OSI Approved :: MIT License",
 ]
 dependencies = [
-    # === Confucius framework deps ===
     "langchain>=0.3.21",
     "langchain-core>=0.3.45",
     "langchain-community>=0.3.0",
@@ -129,8 +128,5 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["black"]
 
-[project.scripts]
-confucius = "confucius.cli.main:main"
-
 [tool.setuptools.packages.find]
-include = ["confucius*", "mm_agents*", "desktop_env*", "self_play*"]
+include = ["mm_agents*", "desktop_env*", "self_play*"]
