@@ -175,6 +175,16 @@ def main():
         logger.error("Failed to fork child 1!")
         return
 
+    # Save screenshot of child 1's display
+    from setup_executor import SetupExecutor
+    executor1 = SetupExecutor(display_num=2, vm_exec=vm_exec)
+    screenshot1 = executor1.take_screenshot()
+    if screenshot1:
+        path = os.path.join(args.output_dir, "child1_alice_search.png")
+        with open(path, "wb") as f:
+            f.write(screenshot1)
+        logger.info(f"[{child1_id}] Screenshot saved: {path}")
+
     # Fork child 2: Find Bob's email
     logger.info(f"\n[{root_id}] Forking child 2 to find Bob's email...")
 
@@ -201,6 +211,15 @@ def main():
     if not child2_id:
         logger.error("Failed to fork child 2!")
         return
+
+    # Save screenshot of child 2's display
+    executor2 = SetupExecutor(display_num=3, vm_exec=vm_exec)
+    screenshot2 = executor2.take_screenshot()
+    if screenshot2:
+        path = os.path.join(args.output_dir, "child2_bob_search.png")
+        with open(path, "wb") as f:
+            f.write(screenshot2)
+        logger.info(f"[{child2_id}] Screenshot saved: {path}")
 
     # Show runtime state
     logger.info("\n" + "-" * 60)
@@ -310,6 +329,9 @@ def main():
     logger.info(f"Fork-based parallel execution achieved {7.0 / wall_clock_time:.2f}x speedup")
     logger.info(f"Displays used: 3 (1 parent + 2 children)")
     logger.info(f"Total agents: 3 (1 root + 2 children)")
+    logger.info(f"\nScreenshots saved to: {args.output_dir}/")
+    logger.info("  - child1_alice_search.png (display :2)")
+    logger.info("  - child2_bob_search.png (display :3)")
 
     # Keep VM alive for inspection
     logger.info(f"\nVM still running. VNC: http://{vm_ip}:5910/vnc.html")
