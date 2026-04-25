@@ -139,6 +139,9 @@ class SetupExecutor:
                 f"{self.display_env} nohup google-chrome "
                 f"--remote-debugging-port={debug_port} "
                 f"--user-data-dir={user_data_dir} "
+                f"--no-first-run "
+                f"--no-default-browser-check "
+                f"--disable-default-apps "
                 f"{url_args} "
                 f">/dev/null 2>&1 &"
             )
