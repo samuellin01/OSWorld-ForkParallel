@@ -130,19 +130,22 @@ class SetupExecutor:
                 time.sleep(0.5)
         else:
             # Launch Chrome with URLs
-            # Use display-specific debugging port to avoid conflicts (1337 + display_num)
+            # Use display-specific debugging port and user data dir to avoid conflicts
             debug_port = 1337 + self.display_num
+            user_data_dir = f"/tmp/chrome_display_{self.display_num}"
             logger.info(f"Launching Chrome with {len(urls)} URL(s) on debug port {debug_port}")
             url_args = " ".join([f"'{url}'" for url in urls])
             cmd = (
                 f"{self.display_env} nohup google-chrome "
-                f"--remote-debugging-port={debug_port} {url_args} "
+                f"--remote-debugging-port={debug_port} "
+                f"--user-data-dir={user_data_dir} "
+                f"{url_args} "
                 f">/dev/null 2>&1 &"
             )
             result = self.vm_exec(cmd)
             if not result:
                 return False
-            time.sleep(4)  # Give Chrome time to start and load page
+            time.sleep(2)  # Give Chrome time to start
 
         return True
 
