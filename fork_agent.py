@@ -235,19 +235,19 @@ def run_fork_agent(
         "\n\n"
     )
 
-    if is_root:
-        system_prompt += (
-            "You can fork subtasks to child agents using the fork_subtask tool. "
-            "Fork when you have independent work that can run in parallel. "
-            "Children will send results back via messages. Use read_messages to check for results. "
-            "\n\n"
-        )
-    else:
+    system_prompt += (
+        "You can fork subtasks to child agents using the fork_subtask tool. "
+        "Fork when you have independent work that can run in parallel. "
+        "Children will send results back via messages. Use read_messages to check for results. "
+    )
+
+    if parent_id:
         system_prompt += (
             "You are a child agent working on a specific subtask. "
             "When done, use send_message to report your result to your parent. "
-            "\n\n"
         )
+
+    system_prompt += "\n\n"
 
     system_prompt += (
         "When you complete your task, output DONE followed by a summary. "
@@ -255,12 +255,13 @@ def run_fork_agent(
     )
 
     # Tools available to this agent
-    tools = [COMPUTER_USE_TOOL]
-    if is_root:
-        # Root agents can fork children and kill them
-        tools.append(FORK_TOOL)
-        tools.append(KILL_CHILD_TOOL)
-    tools.extend([READ_MESSAGES_TOOL, SEND_MESSAGE_TOOL])
+    tools = [
+        COMPUTER_USE_TOOL,
+        FORK_TOOL,
+        KILL_CHILD_TOOL,
+        READ_MESSAGES_TOOL,
+        SEND_MESSAGE_TOOL,
+    ]
 
     # Build initial message
     if parent_context:
