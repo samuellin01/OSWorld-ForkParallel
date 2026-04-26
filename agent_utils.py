@@ -84,9 +84,10 @@ def filter_to_n_most_recent_images(
 COMPUTER_USE_TOOL: Dict[str, Any] = {
     "type": "computer_20251124",
     "name": "computer",
-    "display_width_px": 1280,
-    "display_height_px": 720,
+    "display_width_px": 1920,
+    "display_height_px": 1080,
     "display_number": 1,
+    "enable_zoom": True,  # Opus 4.7: Allow zooming into screen regions for detail
 }
 
 
