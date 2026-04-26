@@ -125,6 +125,26 @@ KILL_CHILD_TOOL: Dict[str, Any] = {
     },
 }
 
+PEEK_CHILD_TOOL: Dict[str, Any] = {
+    "name": "peek_child",
+    "description": (
+        "Check on a child agent's progress without interrupting them. Returns the child's "
+        "current status, screenshot, and full conversation history. Use this to monitor "
+        "progress, detect if a child is stuck in a loop or going down the wrong path. "
+        "The child will not be aware of the peek - they continue working normally."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "child_id": {
+                "type": "string",
+                "description": "ID of the child agent to peek at",
+            },
+        },
+        "required": ["child_id"],
+    },
+}
+
 
 def compress_context(messages: List[Dict[str, Any]]) -> str:
     """Compress agent conversation history to text-only summary.
@@ -259,7 +279,9 @@ def run_fork_agent(
         "and cannot see your screen. If setup opens Chrome to a URL, the subtask should be 'Search for X and report results', "
         "not 'Open Chrome and search for X'. The child starts in the state created by setup.\n"
         "\n"
-        "Children send results via send_message. Use read_messages to check for results. "
+        "Monitoring children: Use peek_child to check a child's progress without interrupting them. You'll see their current "
+        "screenshot and full conversation history. This helps detect if a child is stuck in a loop or going down the wrong path. "
+        "Children send final results via send_message when complete. Use read_messages to check for results. "
     )
 
     if parent_id:
@@ -280,6 +302,7 @@ def run_fork_agent(
         COMPUTER_USE_TOOL,
         FORK_TOOL,
         KILL_CHILD_TOOL,
+        PEEK_CHILD_TOOL,
         READ_MESSAGES_TOOL,
         SEND_MESSAGE_TOOL,
     ]
@@ -365,6 +388,9 @@ def run_fork_agent(
         )
         logger.info(f"{tag} Response: {response_text[:200]}")
         final_response_text = response_text
+
+        # Store in agent's conversation history (for peek_child)
+        runtime.update_conversation(agent_id, {"step": step, "response": response_text})
 
         if output_dir:
             with open(os.path.join(output_dir, f"step_{step:03d}_response.txt"), "w") as f:
@@ -485,6 +511,75 @@ def run_fork_agent(
                     "type": "tool_result",
                     "tool_use_id": tool_use_id,
                     "content": result_text,
+                })
+
+            elif tool_name == "peek_child":
+                # Peek at a child agent
+                child_id = tool_input.get("child_id", "")
+
+                if not child_id:
+                    result_text = "Error: No child_id provided"
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": result_text,
+                    })
+                    continue
+
+                logger.info(f"{tag} Peeking at child {child_id}")
+
+                # Runtime enforces parent-child relationship and returns state
+                peek_data = runtime.peek_child(parent_id=agent_id, child_id=child_id)
+
+                if not peek_data:
+                    result_text = f"Error: Cannot peek at {child_id} (not your child or doesn't exist)"
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": result_text,
+                    })
+                    continue
+
+                # Format peek result for agent
+                import base64
+                screenshot_b64 = None
+                if peek_data.get("screenshot"):
+                    screenshot_b64 = base64.b64encode(peek_data["screenshot"]).decode()
+
+                # Build text summary + image
+                conversation = peek_data.get("conversation", [])
+                conv_text = "\n".join([
+                    f"Step {i+1}: {entry.get('response', '')[:200]}"
+                    for i, entry in enumerate(conversation)
+                ])
+
+                result_content = [
+                    {
+                        "type": "text",
+                        "text": (
+                            f"Child {child_id} status:\n"
+                            f"Status: {peek_data['status']}\n"
+                            f"Steps: {peek_data['steps']}\n"
+                            f"Duration: {peek_data['duration']:.1f}s\n\n"
+                            f"Conversation history:\n{conv_text}"
+                        ),
+                    }
+                ]
+
+                if screenshot_b64:
+                    result_content.append({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": screenshot_b64,
+                        },
+                    })
+
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": result_content,
                 })
 
             elif tool_name == "computer":
