@@ -23,6 +23,7 @@ from google_sheets_oauth import (
     create_sheet_from_template_oauth,
     create_doc_from_template_oauth,
     get_sheet_id_from_url,
+    reset_sheet_from_template,
 )
 
 logging.basicConfig(
@@ -35,36 +36,67 @@ logger = logging.getLogger(__name__)
 def _process_google_workspace_config(task_data: Dict[str, Any]) -> Dict[str, Any]:
     """Process google_sheet_from_template and google_doc_from_template config items.
 
-    Creates fresh Google Sheets/Docs from templates and injects URLs
-    into the task instruction and evaluator.
+    For collaborative tasks, uses pre-created sheets from collaborative_sheet_urls.json
+    and resets them to template state. For other tasks, creates fresh sheets.
 
     Returns modified task_data.
     """
     if "config" not in task_data:
         return task_data
 
+    # Load pre-created sheet URLs if available
+    sheet_urls_file = "collaborative_sheet_urls.json"
+    pre_created_urls = {}
+    if os.path.exists(sheet_urls_file):
+        with open(sheet_urls_file) as f:
+            pre_created_urls = json.load(f)
+        logger.info("[setup] Loaded %d pre-created sheet URLs", len(pre_created_urls))
+
     config_items = task_data["config"]
     new_config = []
     replacements = {}  # {placeholder: url}
+    task_id = task_data.get("id", "unknown")
 
-    # First pass: create sheets/docs and collect URLs
+    # First pass: create/reset sheets/docs and collect URLs
     for item in config_items:
         if item.get("type") == "google_sheet_from_template":
             params = item["parameters"]
             template_url = params["template_url"]
             placeholder = params.get("placeholder", "{SHEET_URL}")
-            title = params.get("title", f"OSWorld Task {task_data.get('id', 'unknown')}")
+            title = params.get("title", f"OSWorld Task {task_id}")
             client_secret_path = params.get("client_secret_path", "oauth_client_secret.json")
             token_path = params.get("token_path", "oauth_token.pickle")
 
-            logger.info("[setup] Creating Google Sheet from template: %s", template_url)
-            sheet_url = create_sheet_from_template_oauth(
-                template_url=template_url,
-                client_secret_path=client_secret_path,
-                token_path=token_path,
-                title=title
-            )
-            logger.info("[setup] Created sheet: %s", sheet_url)
+            # Check if we have a pre-created sheet for this task
+            if task_id in pre_created_urls:
+                sheet_url = pre_created_urls[task_id]
+                logger.info("[setup] Using pre-created sheet: %s", sheet_url)
+                logger.info("[setup] Resetting sheet to template state...")
+                success = reset_sheet_from_template(
+                    sheet_url=sheet_url,
+                    template_url=template_url,
+                    client_secret_path=client_secret_path,
+                    token_path=token_path,
+                )
+                if not success:
+                    logger.warning("[setup] Reset failed, creating new sheet instead")
+                    sheet_url = create_sheet_from_template_oauth(
+                        template_url=template_url,
+                        client_secret_path=client_secret_path,
+                        token_path=token_path,
+                        title=title
+                    )
+                    logger.info("[setup] Created new sheet: %s", sheet_url)
+            else:
+                logger.info("[setup] Creating Google Sheet from template: %s", template_url)
+                sheet_url = create_sheet_from_template_oauth(
+                    template_url=template_url,
+                    client_secret_path=client_secret_path,
+                    token_path=token_path,
+                    title=title
+                )
+                logger.info("[setup] Created sheet: %s", sheet_url)
+
             replacements[placeholder] = sheet_url
 
             # Update evaluator if it references google_sheet type
