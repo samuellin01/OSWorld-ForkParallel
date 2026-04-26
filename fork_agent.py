@@ -261,7 +261,8 @@ def run_fork_agent(
 
     system_prompt += (
         "When you complete your task, output DONE followed by a summary. "
-        "Output FAIL if the task is impossible."
+        "Output FAIL if the task is impossible. "
+        "You are judged on both task completion and efficiency - complete tasks quickly with minimal steps."
     )
 
     # Tools available to this agent
