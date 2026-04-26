@@ -35,7 +35,13 @@ FORK_TOOL: Dict[str, Any] = {
         "you have independent work that can be done in parallel (e.g., searching "
         "for multiple items, filling multiple forms, processing multiple files). "
         "The subtask should be substantial (>15 seconds of work) to justify fork overhead. "
-        "You will receive the child's result via a message when it completes."
+        "You will receive the child's result via a message when it completes.\n\n"
+        "Setup config examples:\n"
+        "- Open Chrome to URL: {\"type\": \"chrome_open_tabs\", \"parameters\": {\"urls_to_open\": [\"https://google.com/search?q=Python\"]}}\n"
+        "- Launch app: {\"type\": \"launch\", \"parameters\": {\"command\": [\"gedit\", \"/tmp/file.txt\"]}}\n"
+        "- Run command: {\"type\": \"command\", \"parameters\": {\"command\": \"mkdir -p /tmp/workspace\"}}\n"
+        "- Download file: {\"type\": \"download\", \"parameters\": {\"files\": [{\"path\": \"/tmp/data.csv\", \"url\": \"https://...\"}]}}\n"
+        "- Wait: {\"type\": \"sleep\", \"parameters\": {\"seconds\": 2}}"
     ),
     "input_schema": {
         "type": "object",
@@ -46,7 +52,7 @@ FORK_TOOL: Dict[str, Any] = {
             },
             "setup": {
                 "type": "array",
-                "description": "Setup steps to prepare the child's environment (OSWorld config format)",
+                "description": "Setup steps to prepare the child's environment before it starts",
                 "items": {
                     "type": "object",
                     "properties": {
