@@ -45,8 +45,8 @@ MODEL_ID_MAP: Dict[str, str] = {
     "claude-4-opus": "us.anthropic.claude-opus-4-20250514-v1:0",
     # Claude 4.6 Opus
     "claude-opus-4-6": "us.anthropic.claude-opus-4-6-v1",
-    # Claude 4.7 Opus
-    "claude-opus-4-7": "us.anthropic.claude-opus-4-7",
+    # Claude 4.7 Opus (cross-region inference)
+    "claude-opus-4-7": "anthropic.claude-opus-4-7",
 }
 
 # Beta flag required for computer-use tools
