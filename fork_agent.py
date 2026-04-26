@@ -100,6 +100,25 @@ SEND_MESSAGE_TOOL: Dict[str, Any] = {
     },
 }
 
+KILL_CHILD_TOOL: Dict[str, Any] = {
+    "name": "kill_child",
+    "description": (
+        "Terminate a child agent. Use this if a child is stuck, working on the wrong "
+        "thing, or no longer needed. The child will be stopped immediately and its "
+        "display will be released back to the pool. Only parents can kill their children."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "child_id": {
+                "type": "string",
+                "description": "ID of the child agent to terminate",
+            },
+        },
+        "required": ["child_id"],
+    },
+}
+
 
 def compress_context(messages: List[Dict[str, Any]]) -> str:
     """Compress agent conversation history to text-only summary.
@@ -238,7 +257,9 @@ def run_fork_agent(
     # Tools available to this agent
     tools = [COMPUTER_USE_TOOL]
     if is_root:
+        # Root agents can fork children and kill them
         tools.append(FORK_TOOL)
+        tools.append(KILL_CHILD_TOOL)
     tools.extend([READ_MESSAGES_TOOL, SEND_MESSAGE_TOOL])
 
     # Build initial message
@@ -409,6 +430,33 @@ def run_fork_agent(
 
                 runtime.send_message(from_agent=agent_id, to_agent=to, content=content)
                 result_text = f"Message sent to {to}"
+                logger.info(f"{tag} {result_text}")
+
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": result_text,
+                })
+
+            elif tool_name == "kill_child":
+                # Kill a child agent
+                child_id = tool_input.get("child_id", "")
+
+                if not child_id:
+                    result_text = "Error: No child_id provided"
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": result_text,
+                    })
+                    continue
+
+                logger.info(f"{tag} Killing child {child_id}")
+
+                # Runtime enforces parent-child relationship
+                runtime.kill_agent(agent_id=child_id, killer_id=agent_id)
+
+                result_text = f"Child {child_id} has been terminated"
                 logger.info(f"{tag} {result_text}")
 
                 tool_results.append({
