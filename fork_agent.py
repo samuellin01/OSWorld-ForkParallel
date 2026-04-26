@@ -71,41 +71,6 @@ FORK_TOOL: Dict[str, Any] = {
 }
 
 
-# Message tool definitions
-READ_MESSAGES_TOOL: Dict[str, Any] = {
-    "name": "read_messages",
-    "description": (
-        "Check for messages from your children (if you're a parent) or from your "
-        "parent (if you're a child). Returns a list of messages with sender and content."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {},
-    },
-}
-
-SEND_MESSAGE_TOOL: Dict[str, Any] = {
-    "name": "send_message",
-    "description": (
-        "Send a message to your parent (if you're a child) or to a specific child "
-        "(if you're a parent). Use this to report results or request information."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "to": {
-                "type": "string",
-                "description": "Agent ID to send to (use 'parent' if you're a child, or child_id if you're a parent)",
-            },
-            "content": {
-                "type": "object",
-                "description": "Message content (any structured data)",
-            },
-        },
-        "required": ["to", "content"],
-    },
-}
-
 KILL_CHILD_TOOL: Dict[str, Any] = {
     "name": "kill_child",
     "description": (
@@ -281,13 +246,13 @@ def run_fork_agent(
         "\n"
         "Monitoring children: Use peek_child to check a child's progress without interrupting them. You'll see their current "
         "screenshot and full conversation history. This helps detect if a child is stuck in a loop or going down the wrong path. "
-        "Children send final results via send_message when complete. Use read_messages to check for results. "
+        "When a child completes, their result will automatically appear in your next observation - you don't need to request it."
     )
 
     if parent_id:
         system_prompt += (
-            "You are a child agent working on a specific subtask. Your display has been prepared via setup config. "
-            "When done, use send_message to report your result to your parent. "
+            "\n\nYou are a child agent working on a specific subtask. Your display has been prepared via setup config. "
+            "When done, just output DONE with your result. Your parent will automatically receive it."
         )
 
     system_prompt += "\n\n"
@@ -303,8 +268,6 @@ def run_fork_agent(
         FORK_TOOL,
         KILL_CHILD_TOOL,
         PEEK_CHILD_TOOL,
-        READ_MESSAGES_TOOL,
-        SEND_MESSAGE_TOOL,
     ]
 
     # Build initial message
@@ -330,6 +293,9 @@ def run_fork_agent(
     for step in range(1, max_steps + 1):
         logger.info(f"{tag} Step {step}/{max_steps}")
 
+        # Check for child results (auto-inject)
+        child_results = runtime.get_pending_child_results(agent_id)
+
         # Take screenshot
         shot = display.screenshot()
         if shot:
@@ -340,22 +306,62 @@ def run_fork_agent(
                 with open(shot_path, "wb") as f:
                     f.write(shot)
 
-            obs_content: List[Dict[str, Any]] = [
-                {"type": "text", "text": f"Step {step}: current desktop state."},
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "image/png",
-                        "data": base64.b64encode(shot).decode(),
-                    },
+            obs_content: List[Dict[str, Any]] = []
+
+            # Inject child results first
+            if child_results:
+                for child_result in child_results:
+                    child_id = child_result.get("child_id", "unknown")
+                    if child_result.get("status") == "completed":
+                        result_data = child_result.get("result", {})
+                        summary = result_data.get("summary", str(result_data))
+                        obs_content.append({
+                            "type": "text",
+                            "text": f"Child {child_id} completed:\n{summary}"
+                        })
+                        logger.info(f"{tag} ← Result from {child_id}")
+                    elif child_result.get("status") == "failed":
+                        error = child_result.get("error", "unknown error")
+                        obs_content.append({
+                            "type": "text",
+                            "text": f"Child {child_id} failed: {error}"
+                        })
+                        logger.info(f"{tag} ← Failure from {child_id}")
+
+            obs_content.append({"type": "text", "text": f"Step {step}: current desktop state."})
+            obs_content.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": base64.b64encode(shot).decode(),
                 },
-            ]
+            })
         else:
             logger.warning(f"{tag} Screenshot failed")
-            obs_content = [
-                {"type": "text", "text": f"Step {step}: screenshot unavailable."},
-            ]
+            obs_content = []
+
+            # Inject child results even if screenshot failed
+            if child_results:
+                for child_result in child_results:
+                    child_id = child_result.get("child_id", "unknown")
+                    if child_result.get("status") == "completed":
+                        result_data = child_result.get("result", {})
+                        summary = result_data.get("summary", str(result_data))
+                        obs_content.append({
+                            "type": "text",
+                            "text": f"Child {child_id} completed:\n{summary}"
+                        })
+                        logger.info(f"{tag} ← Result from {child_id}")
+                    elif child_result.get("status") == "failed":
+                        error = child_result.get("error", "unknown error")
+                        obs_content.append({
+                            "type": "text",
+                            "text": f"Child {child_id} failed: {error}"
+                        })
+                        logger.info(f"{tag} ← Failure from {child_id}")
+
+            obs_content.append({"type": "text", "text": f"Step {step}: screenshot unavailable."})
 
         # Prepend tool_result if needed
         if last_tool_use_id:
@@ -430,55 +436,6 @@ def run_fork_agent(
                 else:
                     result_text = f"Failed to fork child (no displays available?)"
                     logger.error(f"{tag} {result_text}")
-
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": tool_use_id,
-                    "content": result_text,
-                })
-
-            elif tool_name == "read_messages":
-                # Check for messages
-                msgs = []
-                while True:
-                    msg = runtime.receive_message(agent_id, timeout=0)
-                    if not msg:
-                        break
-                    msgs.append({
-                        "from": msg.from_agent,
-                        "content": msg.content,
-                    })
-
-                result_text = f"Received {len(msgs)} message(s): {msgs}" if msgs else "No messages"
-                logger.info(f"{tag} {result_text}")
-
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": tool_use_id,
-                    "content": result_text,
-                })
-
-            elif tool_name == "send_message":
-                # Send message
-                to = tool_input.get("to", "")
-                content = tool_input.get("content", {})
-
-                # Resolve "parent" to actual parent_id
-                if to == "parent":
-                    if parent_id:
-                        to = parent_id
-                    else:
-                        result_text = "Error: You have no parent (you're the root agent)"
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": tool_use_id,
-                            "content": result_text,
-                        })
-                        continue
-
-                runtime.send_message(from_agent=agent_id, to_agent=to, content=content)
-                result_text = f"Message sent to {to}"
-                logger.info(f"{tag} {result_text}")
 
                 tool_results.append({
                     "type": "tool_result",
