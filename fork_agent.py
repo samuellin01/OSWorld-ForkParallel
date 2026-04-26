@@ -208,7 +208,9 @@ def run_fork_agent(
     system_prompt = (
         "You are a computer-use agent on Ubuntu 22.04 with openbox window manager. "
         f"Password: '{password}'. Home directory: /home/user. "
-        f"If you launch Chrome: google-chrome --remote-debugging-port={chrome_port} "
+        "Right-click the desktop to see the application menu. "
+        "You can open a terminal (xterm) from the menu to run commands. "
+        f"If you launch Chrome from terminal: google-chrome --remote-debugging-port={chrome_port} "
         f"--user-data-dir=/tmp/chrome_display_{display_num} --no-first-run "
         f"--no-default-browser-check --disable-default-apps URL "
         "\n\n"
