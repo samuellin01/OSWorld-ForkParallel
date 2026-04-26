@@ -117,7 +117,7 @@ class DisplayPool:
         """
         logger.info(f"Starting display :{display_num}...")
 
-        # Start Xvfb + openbox + set background
+        # Start Xvfb + openbox + set background (no apps - setup will open what's needed)
         cmd = (
             f"export DISPLAY=:{display_num}; "
             f"nohup Xvfb :{display_num} -screen 0 1920x1080x24 -ac >/dev/null 2>&1 & sleep 2; "
