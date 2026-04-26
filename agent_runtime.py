@@ -45,6 +45,7 @@ class Agent:
     context_summary: Optional[str] = None
     children: Set[str] = field(default_factory=set)
     message_queue: Queue = field(default_factory=Queue)
+    conversation_history: List[Dict[str, Any]] = field(default_factory=list)
     result: Optional[Any] = None
     start_time: float = field(default_factory=time.time)
     end_time: Optional[float] = None
@@ -358,6 +359,66 @@ class AgentRuntime:
                 self.display_pool.release(agent.display_num)
 
             logger.warning(f"⚠ Agent {agent_id} killed by {killer_id}")
+
+    def peek_child(self, parent_id: str, child_id: str) -> Optional[Dict[str, Any]]:
+        """Peek at a child agent's progress without interrupting them.
+
+        Args:
+            parent_id: ID of parent agent requesting peek
+            child_id: ID of child agent to peek at
+
+        Returns:
+            Dict with child status, screenshot, conversation history, or None if invalid
+        """
+        with self._agent_lock:
+            parent = self.agents.get(parent_id)
+            child = self.agents.get(child_id)
+
+            if not parent or not child:
+                logger.error(f"Cannot peek: invalid agent IDs")
+                return None
+
+            # Only parent can peek at child
+            if child.parent_id != parent_id:
+                logger.error(f"Cannot peek: {parent_id} is not parent of {child_id}")
+                return None
+
+            # Get child info
+            duration = (
+                (child.end_time - child.start_time)
+                if child.end_time
+                else (time.time() - child.start_time)
+            )
+
+            # Take screenshot of child's display
+            from setup_executor import SetupExecutor
+            executor = SetupExecutor(display_num=child.display_num, vm_exec=self.vm_exec)
+            screenshot = executor.take_screenshot()
+
+            # Return child state
+            result = {
+                "child_id": child_id,
+                "status": child.status.value,
+                "steps": len(child.conversation_history),
+                "duration": duration,
+                "screenshot": screenshot,  # bytes or None
+                "conversation": child.conversation_history,
+            }
+
+            logger.info(f"👀 {parent_id} peeking at {child_id} (step {len(child.conversation_history)})")
+            return result
+
+    def update_conversation(self, agent_id: str, entry: Dict[str, Any]):
+        """Add an entry to agent's conversation history.
+
+        Args:
+            agent_id: Agent ID
+            entry: Conversation entry (e.g., {"step": 1, "response": "..."})
+        """
+        with self._agent_lock:
+            agent = self.agents.get(agent_id)
+            if agent:
+                agent.conversation_history.append(entry)
 
     def get_agent_status(self, agent_id: str) -> Optional[Dict[str, Any]]:
         """Get status of an agent.
