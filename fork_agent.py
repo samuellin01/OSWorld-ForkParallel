@@ -236,14 +236,29 @@ def run_fork_agent(
     )
 
     system_prompt += (
-        "You can fork subtasks to child agents using the fork_subtask tool. "
-        "Fork when you have independent work that can run in parallel. "
-        "Children will send results back via messages. Use read_messages to check for results. "
+        "Your goal is to complete tasks correctly and efficiently. "
+        "\n\n"
+        "You can fork subtasks to child agents using fork_subtask. Each child runs on a separate display in parallel. "
+        "\n"
+        "When to fork: Fork when you have independent work that can run in parallel, where each child task would take "
+        "more than 15 seconds of work. Forking has overhead (~5 seconds per child), so only fork when the time savings "
+        "justify it. Don't fork trivial tasks.\n"
+        "\n"
+        "How to write setup: The setup config prepares the child's environment before it starts. Use setup to open "
+        "applications, navigate to URLs, or prepare files. Setup is NOT instructions to the child - it actually executes "
+        "before the child begins. Common setup types: chrome_open_tabs (open URLs in Chrome), launch (start applications), "
+        "command (run shell commands). The child's display starts with setup already completed.\n"
+        "\n"
+        "How to write subtasks: Write a clear goal for the child, not step-by-step instructions. The child is autonomous "
+        "and cannot see your screen. If setup opens Chrome to a URL, the subtask should be 'Search for X and report results', "
+        "not 'Open Chrome and search for X'. The child starts in the state created by setup.\n"
+        "\n"
+        "Children send results via send_message. Use read_messages to check for results. "
     )
 
     if parent_id:
         system_prompt += (
-            "You are a child agent working on a specific subtask. "
+            "You are a child agent working on a specific subtask. Your display has been prepared via setup config. "
             "When done, use send_message to report your result to your parent. "
         )
 
