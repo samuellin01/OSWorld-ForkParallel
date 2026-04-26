@@ -51,16 +51,16 @@ def agent_monitor_thread(
         all_agents = runtime.get_all_agents()
 
         for agent_id, status_dict in all_agents.items():
-            status = status_dict["status"]
+            status = status_dict["status"]  # This is a string, not enum
 
             # Skip if already running or completed
             if agent_id in running_threads:
                 continue
-            if status in (AgentStatus.COMPLETED, AgentStatus.FAILED, AgentStatus.KILLED):
+            if status in ("completed", "failed", "killed"):
                 continue
 
             # Skip if not ready (still initializing)
-            if status != AgentStatus.RUNNING:
+            if status != "running":
                 continue
 
             # New agent that needs to run
@@ -71,7 +71,7 @@ def agent_monitor_thread(
 
             # Get agent details
             agent_info = runtime.get_agent_status(agent_id)
-            task = agent_info.get("task", "")
+            task = agent_info.get("subtask", "")
             parent_id = agent_info.get("parent_id")
             context_summary = agent_info.get("context_summary")
 
@@ -104,7 +104,7 @@ def agent_monitor_thread(
 
         # Check if root is done
         root_status = runtime.get_agent_status("root")
-        if root_status and root_status["status"] in (AgentStatus.COMPLETED, AgentStatus.FAILED):
+        if root_status and root_status["status"] in ("completed", "failed"):
             logger.info("[Monitor] Root agent finished, stopping monitor")
             break
 
@@ -237,8 +237,8 @@ def main():
         "the fork_subtask tool. Report both results when complete."
     )
 
-    # Spawn root agent on display :2
-    root_id = runtime.spawn_root_agent(task=task, display_num=2)
+    # Spawn root agent on display :0 (primary desktop, like benchmark)
+    root_id = runtime.spawn_root_agent(task=task, display_num=0)
     logger.info(f"\n[{root_id}] Task: {task}")
 
     # Start agent monitor thread
@@ -259,9 +259,9 @@ def main():
             logger.error("Root agent disappeared!")
             break
 
-        status = root_status["status"]
-        if status in (AgentStatus.COMPLETED, AgentStatus.FAILED, AgentStatus.KILLED):
-            logger.info(f"[Main] Root agent finished with status: {status.value}")
+        status = root_status["status"]  # This is a string
+        if status in ("completed", "failed", "killed"):
+            logger.info(f"[Main] Root agent finished with status: {status}")
             break
 
     # Wait a bit for monitor thread to finish
@@ -274,7 +274,7 @@ def main():
 
     all_agents = runtime.get_all_agents()
     for agent_id, info in all_agents.items():
-        logger.info(f"{agent_id}: {info['status'].value} (display :{info['display_num']})")
+        logger.info(f"{agent_id}: {info['status']} (display :{info['display_num']})")
 
     root_info = runtime.get_agent_status(root_id)
     if root_info and root_info.get("result"):
