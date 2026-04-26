@@ -12,19 +12,117 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
 import requests
 
 from agent_runtime import AgentRuntime, AgentStatus
 from bedrock_client import BedrockClient
 from fork_agent import run_fork_agent
+from google_sheets_oauth import (
+    create_sheet_from_template_oauth,
+    create_doc_from_template_oauth,
+    get_sheet_id_from_url,
+)
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+def _process_google_workspace_config(task_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Process google_sheet_from_template and google_doc_from_template config items.
+
+    Creates fresh Google Sheets/Docs from templates and injects URLs
+    into the task instruction and evaluator.
+
+    Returns modified task_data.
+    """
+    if "config" not in task_data:
+        return task_data
+
+    config_items = task_data["config"]
+    new_config = []
+    replacements = {}  # {placeholder: url}
+
+    # First pass: create sheets/docs and collect URLs
+    for item in config_items:
+        if item.get("type") == "google_sheet_from_template":
+            params = item["parameters"]
+            template_url = params["template_url"]
+            placeholder = params.get("placeholder", "{SHEET_URL}")
+            title = params.get("title", f"OSWorld Task {task_data.get('id', 'unknown')}")
+            client_secret_path = params.get("client_secret_path", "oauth_client_secret.json")
+            token_path = params.get("token_path", "oauth_token.pickle")
+
+            logger.info("[setup] Creating Google Sheet from template: %s", template_url)
+            sheet_url = create_sheet_from_template_oauth(
+                template_url=template_url,
+                client_secret_path=client_secret_path,
+                token_path=token_path,
+                title=title
+            )
+            logger.info("[setup] Created sheet: %s", sheet_url)
+            replacements[placeholder] = sheet_url
+
+            # Update evaluator if it references google_sheet type
+            if "evaluator" in task_data and "result" in task_data["evaluator"]:
+                result_config = task_data["evaluator"]["result"]
+                if result_config.get("type") == "google_sheet":
+                    sheet_id = get_sheet_id_from_url(sheet_url)
+                    result_config["sheet_id"] = sheet_id
+
+            # Optionally open sheet in Chrome if requested
+            if params.get("open_in_chrome", False):
+                new_config.append({
+                    "type": "chrome_open_tabs",
+                    "parameters": {"urls_to_open": [sheet_url]}
+                })
+
+        elif item.get("type") == "google_doc_from_template":
+            params = item["parameters"]
+            template_url = params["template_url"]
+            placeholder = params.get("placeholder", "{DOC_URL}")
+            title = params.get("title", f"OSWorld Task Doc {task_data.get('id', 'unknown')}")
+            client_secret_path = params.get("client_secret_path", "oauth_client_secret.json")
+            token_path = params.get("token_path", "oauth_token.pickle")
+
+            logger.info("[setup] Creating Google Doc from template: %s", template_url)
+            doc_url = create_doc_from_template_oauth(
+                template_url=template_url,
+                client_secret_path=client_secret_path,
+                token_path=token_path,
+                title=title
+            )
+            logger.info("[setup] Created doc: %s", doc_url)
+            replacements[placeholder] = doc_url
+
+            # Update evaluator if it references google_doc type
+            if "evaluator" in task_data and "result" in task_data["evaluator"]:
+                result_config = task_data["evaluator"]["result"]
+                if result_config.get("type") == "google_doc":
+                    doc_id = get_sheet_id_from_url(doc_url)  # Same extraction logic
+                    result_config["doc_id"] = doc_id
+
+            # Optionally open doc in Chrome if requested
+            if params.get("open_in_chrome", False):
+                new_config.append({
+                    "type": "chrome_open_tabs",
+                    "parameters": {"urls_to_open": [doc_url]}
+                })
+        else:
+            # Keep other config items as-is
+            new_config.append(item)
+
+    # Replace all placeholders in instruction
+    if "instruction" in task_data:
+        for placeholder, url in replacements.items():
+            task_data["instruction"] = task_data["instruction"].replace(placeholder, url)
+
+    task_data["config"] = new_config
+    return task_data
 
 
 def agent_monitor_thread(
@@ -209,6 +307,9 @@ def load_collaborative_tasks():
 
 def run_single_task(task_data, args, output_base):
     """Run a single benchmark task."""
+    # Process Google Workspace configs BEFORE booting VM
+    task_data = _process_google_workspace_config(task_data)
+
     task_id = task_data.get("id", "unknown")
     instruction = task_data.get("instruction", "")
     config = task_data.get("config", [])
