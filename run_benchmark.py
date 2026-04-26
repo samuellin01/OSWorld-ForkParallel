@@ -222,20 +222,24 @@ def run_agent_thread(
         runtime.fail_agent(agent_id, error=str(e))
 
 
-def load_osworld_tasks(task_type="standard"):
+def load_osworld_tasks(task_type="standard", test_file=None):
     """Load OSWorld benchmark tasks from evaluation_examples.
 
     Args:
         task_type: "standard" for regular tasks, "collaborative" for collaborative tasks
+        test_file: Optional specific test file (e.g., "test_all.json", "test_small.json")
     """
     if task_type == "collaborative":
         return load_collaborative_tasks()
 
     # Load task IDs from test file
-    task_list_paths = [
-        "evaluation_examples/test_small.json",  # Start with small set
-        "evaluation_examples/test_all.json",
-    ]
+    if test_file:
+        task_list_paths = [f"evaluation_examples/{test_file}"]
+    else:
+        task_list_paths = [
+            "evaluation_examples/test_small.json",  # Start with small set
+            "evaluation_examples/test_all.json",
+        ]
 
     task_ids_by_category = None
     for path in task_list_paths:
@@ -465,6 +469,8 @@ def main():
     parser.add_argument("--domain", type=str, default=None, help="Filter tasks by domain (e.g., chrome, gimp, multi_apps, all)")
     parser.add_argument("--task-type", default="standard", choices=["standard", "collaborative"],
                         help="Task type: standard or collaborative")
+    parser.add_argument("--test-file", type=str, default=None,
+                        help="Specific test file to use (e.g., test_all.json, test_small.json). Default: auto-detect")
     parser.add_argument("--provider-name", default="aws", help="Provider")
     parser.add_argument("--region", default="us-east-1", help="AWS region")
     parser.add_argument("--headless", action="store_true", help="Run headless")
@@ -475,7 +481,7 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     # Load tasks
-    tasks = load_osworld_tasks(task_type=args.task_type)
+    tasks = load_osworld_tasks(task_type=args.task_type, test_file=args.test_file)
     if not tasks:
         logger.error("No tasks found!")
         return
