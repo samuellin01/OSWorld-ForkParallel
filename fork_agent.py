@@ -696,8 +696,11 @@ def run_fork_agent(
             # Continue to next step to get agent's response to tool results
             continue
 
-        # Check for DONE/FAIL
-        if "DONE" in final_response_text.upper():
+        # Check for DONE/FAIL (strict: must be first line)
+        import re
+        first_line = final_response_text.strip().split('\n')[0].strip()
+
+        if re.match(r'^DONE(?:\s*$|[\s:.\-])', first_line, re.IGNORECASE):
             logger.info(f"{tag} DONE at step {step}")
             duration = time.time() - start_time
             result = {
@@ -709,7 +712,7 @@ def run_fork_agent(
             runtime.complete_agent(agent_id, result=result)
             return result
 
-        if "FAIL" in final_response_text.upper():
+        if re.match(r'^FAIL(?:\s*$|[\s:.\-])', first_line, re.IGNORECASE):
             logger.info(f"{tag} FAIL at step {step}")
             duration = time.time() - start_time
             result = {
