@@ -829,19 +829,9 @@ print(f'Opened {len(urls)} tabs')
                 except Exception as e:
                     logger.warning("Failed to open tab %d (%s): %s", i + 1, url, e)
 
-        # Bring Chrome window to focus using wmctrl.
-        focus_payload = json.dumps({
-            "command": "wmctrl -a Chrome || wmctrl -a chrome || true",
-            "shell": True,
-        })
-        try:
-            requests.post(
-                self.http_server + "/setup/execute",
-                headers=headers, data=focus_payload, timeout=10,
-            )
-            logger.info("Raised Chrome window via wmctrl")
-        except Exception as e:
-            logger.warning("Could not raise Chrome window: %s", e)
+        # NOTE: We don't automatically raise Chrome window.
+        # Window focus is controlled explicitly via activate_window setup steps.
+        # This gives us predictable, configurable window stacking.
 
         # Diagnostic: check Chrome is still running.
         diag_payload = json.dumps({
