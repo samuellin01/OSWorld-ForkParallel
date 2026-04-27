@@ -87,42 +87,13 @@ class DisplayPool:
         # Install prerequisites (if not already present)
         logger.info("Ensuring display prerequisites installed...")
         result = self.vm_exec(
-            "which Xvfb scrot openbox xterm xdotool pcmanfm > /dev/null 2>&1 || "
+            "which Xvfb scrot openbox xterm xdotool tint2 > /dev/null 2>&1 || "
             f"(echo '{self.password}' | sudo -S apt-get update -qq && "
-            f"echo '{self.password}' | sudo -S apt-get install -y xvfb scrot openbox xterm xdotool pcmanfm)"
+            f"echo '{self.password}' | sudo -S apt-get install -y xvfb scrot openbox xterm xdotool tint2)"
         )
         if not result or result.get("returncode") != 0:
             logger.error("Failed to install display prerequisites")
             return False
-
-        # Create desktop shortcuts (one-time setup)
-        logger.info("Setting up desktop shortcuts...")
-        desktop_setup = (
-            "mkdir -p ~/Desktop && "
-            "cat > ~/Desktop/chrome.desktop << 'EOF'\n"
-            "[Desktop Entry]\n"
-            "Name=Chrome\n"
-            "Exec=google-chrome --remote-debugging-port=1337\n"
-            "Icon=google-chrome\n"
-            "Type=Application\n"
-            "EOF\n"
-            "&& cat > ~/Desktop/terminal.desktop << 'EOF'\n"
-            "[Desktop Entry]\n"
-            "Name=Terminal\n"
-            "Exec=xterm\n"
-            "Icon=utilities-terminal\n"
-            "Type=Application\n"
-            "EOF\n"
-            "&& cat > ~/Desktop/files.desktop << 'EOF'\n"
-            "[Desktop Entry]\n"
-            "Name=Files\n"
-            "Exec=pcmanfm\n"
-            "Icon=system-file-manager\n"
-            "Type=Application\n"
-            "EOF\n"
-            "&& chmod +x ~/Desktop/*.desktop"
-        )
-        self.vm_exec(desktop_setup)
 
         # Start each display
         success_count = 0
@@ -146,13 +117,13 @@ class DisplayPool:
         """
         logger.info(f"Starting display :{display_num}...")
 
-        # Start Xvfb + openbox + desktop icons + set background
+        # Start Xvfb + openbox + taskbar + set background
         cmd = (
             f"export DISPLAY=:{display_num}; "
             f"nohup Xvfb :{display_num} -screen 0 1920x1080x24 -ac >/dev/null 2>&1 & sleep 2; "
             f"nohup openbox >/dev/null 2>&1 & sleep 1; "
             f"xsetroot -solid '#2C3E50' || true; "
-            f"nohup pcmanfm --desktop >/dev/null 2>&1 & sleep 0.5; "
+            f"nohup tint2 >/dev/null 2>&1 & sleep 0.5; "
         )
 
         result = self.vm_exec(cmd)
