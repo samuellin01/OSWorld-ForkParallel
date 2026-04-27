@@ -36,8 +36,11 @@ logger = logging.getLogger(__name__)
 def _process_google_workspace_config(task_data: Dict[str, Any]) -> Dict[str, Any]:
     """Process google_sheet_from_template and google_doc_from_template config items.
 
-    For collaborative tasks, uses pre-created sheets from collaborative_sheet_urls.json
-    and resets them to template state. For other tasks, creates fresh sheets.
+    Simplified approach for collaborative tasks:
+    1. Create/reset sheet (pre-boot)
+    2. Keep non-Google config items (download, open, sleep)
+    3. Add chrome_open_tabs with sheet URL
+    4. Add final activate_window to bring non-Chrome window to front
 
     Returns modified task_data.
     """
@@ -56,11 +59,14 @@ def _process_google_workspace_config(task_data: Dict[str, Any]) -> Dict[str, Any
     new_config = []
     replacements = {}  # {placeholder: url}
     task_id = task_data.get("id", "unknown")
-    chrome_urls_to_add = []  # Collect all Chrome URLs to open in one window
+    chrome_urls = []
+    final_window = None  # Track which window should be in front at the end
 
-    # First pass: create/reset sheets/docs and collect URLs
+    # Process each config item
     for item in config_items:
-        if item.get("type") == "google_sheet_from_template":
+        item_type = item.get("type")
+
+        if item_type == "google_sheet_from_template":
             params = item["parameters"]
             template_url = params["template_url"]
             placeholder = params.get("placeholder", "{SHEET_URL}")
@@ -68,7 +74,7 @@ def _process_google_workspace_config(task_data: Dict[str, Any]) -> Dict[str, Any
             client_secret_path = params.get("client_secret_path", "oauth_client_secret.json")
             token_path = params.get("token_path", "oauth_token.pickle")
 
-            # Check if we have a pre-created sheet for this task
+            # Create/reset sheet
             if task_id in pre_created_urls:
                 sheet_url = pre_created_urls[task_id]
                 logger.info("[setup] Using pre-created sheet: %s", sheet_url)
@@ -100,22 +106,22 @@ def _process_google_workspace_config(task_data: Dict[str, Any]) -> Dict[str, Any
 
             replacements[placeholder] = sheet_url
 
-            # Update evaluator if it references google_sheet type
+            # Update evaluator
             if "evaluator" in task_data and "result" in task_data["evaluator"]:
                 result_config = task_data["evaluator"]["result"]
                 if result_config.get("type") == "google_sheet":
                     sheet_id = get_sheet_id_from_url(sheet_url)
                     result_config["sheet_id"] = sheet_id
 
-            # Optionally open sheet in Chrome if requested
+            # Add to Chrome URLs if requested
             if params.get("open_in_chrome", False):
-                chrome_urls_to_add.append(sheet_url)
+                chrome_urls.append(sheet_url)
 
-        elif item.get("type") == "google_doc_from_template":
+        elif item_type == "google_doc_from_template":
             params = item["parameters"]
             template_url = params["template_url"]
             placeholder = params.get("placeholder", "{DOC_URL}")
-            title = params.get("title", f"OSWorld Task Doc {task_data.get('id', 'unknown')}")
+            title = params.get("title", f"OSWorld Task Doc {task_id}")
             client_secret_path = params.get("client_secret_path", "oauth_client_secret.json")
             token_path = params.get("token_path", "oauth_token.pickle")
 
@@ -129,42 +135,54 @@ def _process_google_workspace_config(task_data: Dict[str, Any]) -> Dict[str, Any
             logger.info("[setup] Created doc: %s", doc_url)
             replacements[placeholder] = doc_url
 
-            # Update evaluator if it references google_doc type
+            # Update evaluator
             if "evaluator" in task_data and "result" in task_data["evaluator"]:
                 result_config = task_data["evaluator"]["result"]
                 if result_config.get("type") == "google_doc":
-                    doc_id = get_sheet_id_from_url(doc_url)  # Same extraction logic
+                    doc_id = get_sheet_id_from_url(doc_url)
                     result_config["doc_id"] = doc_id
 
-            # Optionally open doc in Chrome if requested
+            # Add to Chrome URLs if requested
             if params.get("open_in_chrome", False):
-                chrome_urls_to_add.append(doc_url)
-        elif item.get("type") == "chrome_open_tabs":
-            # Merge existing Chrome URLs with our new ones
-            existing_urls = item.get("parameters", {}).get("urls_to_open", [])
-            chrome_urls_to_add.extend(existing_urls)
-        elif item.get("type") == "launch":
-            # Skip redundant Chrome launches - chrome_open_tabs handles it
+                chrome_urls.append(doc_url)
+
+        elif item_type == "activate_window":
+            # Remember the last window to activate (we'll do it at the end)
+            final_window = item.get("parameters", {}).get("window_name")
+
+        elif item_type == "launch":
+            # Skip Chrome launches - chrome_open_tabs handles it
             command = item.get("parameters", {}).get("command", [])
-            if isinstance(command, list) and len(command) > 0 and "chrome" in command[0].lower():
-                logger.info("[setup] Skipping redundant Chrome launch (chrome_open_tabs will handle it)")
+            if isinstance(command, list) and command and "chrome" in command[0].lower():
                 continue
             new_config.append(item)
+
+        elif item_type == "chrome_open_tabs":
+            # Don't add yet - we'll add at the end
+            pass
+
         else:
-            # Keep other config items as-is
+            # Keep everything else (download, open, sleep, etc.)
             new_config.append(item)
 
-    # Replace all placeholders in instruction
+    # Add chrome_open_tabs with all collected URLs
+    if chrome_urls:
+        new_config.append({
+            "type": "chrome_open_tabs",
+            "parameters": {"urls_to_open": chrome_urls}
+        })
+
+    # Add final window activation (brings non-Chrome window to front)
+    if final_window:
+        new_config.append({
+            "type": "activate_window",
+            "parameters": {"window_name": final_window, "strict": True}
+        })
+
+    # Replace placeholders in instruction
     if "instruction" in task_data:
         for placeholder, url in replacements.items():
             task_data["instruction"] = task_data["instruction"].replace(placeholder, url)
-
-    # Add single chrome_open_tabs config with all URLs (opens all tabs in same window)
-    if chrome_urls_to_add:
-        new_config.append({
-            "type": "chrome_open_tabs",
-            "parameters": {"urls_to_open": chrome_urls_to_add}
-        })
 
     task_data["config"] = new_config
     return task_data
