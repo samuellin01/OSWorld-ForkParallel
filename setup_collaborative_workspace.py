@@ -134,7 +134,11 @@ def main():
             task_data = json.load(f)
 
         # Find Google Workspace config step (sheet/doc/slide)
+        # Check both new format (specific.google_account.config) and old format (config)
         config_steps = task_data.get("specific", {}).get("google_account", {}).get("config", [])
+        if not config_steps:
+            config_steps = task_data.get("config", [])
+
         workspace_config = None
         workspace_type = None
 
