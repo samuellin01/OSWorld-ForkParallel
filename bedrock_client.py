@@ -45,8 +45,7 @@ MODEL_ID_MAP: Dict[str, str] = {
     "claude-4-opus": "us.anthropic.claude-opus-4-20250514-v1:0",
     # Claude 4.6 Opus
     "claude-opus-4-6": "us.anthropic.claude-opus-4-6-v1",
-    # Claude 4.7 Opus (via inference profile)
-    "claude-opus-4-7": "us.anthropic.claude-opus-4-7",
+    # Note: Claude 4.7 exists but doesn't support computer_20251124 tools on Bedrock yet
 }
 
 # Beta flag required for computer-use tools
