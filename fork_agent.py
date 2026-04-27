@@ -264,10 +264,10 @@ def run_fork_agent(
         # Child agent: worker only, cannot fork
         system_prompt += (
             "You are a worker agent assigned a specific subtask. Your display has been prepared via setup config. "
-            "Focus on completing your subtask efficiently. When done, output DONE with your result. "
+            "Focus on completing your subtask efficiently. When done, output TASK COMPLETED with your result. "
             "Your parent will automatically receive it.\n"
             "\n"
-            "Before outputting DONE, remind yourself what your subtask was and check you've actually completed it."
+            "Before outputting TASK COMPLETED, remind yourself what your subtask was and check you've actually completed it."
         )
     else:
         # Root agent: can fork workers
@@ -296,7 +296,7 @@ def run_fork_agent(
             "\n"
             "Your workers are capable - trust their results and use them to reduce your workload rather than re-doing their research.\n"
             "\n"
-            "Before outputting DONE, confirm you received results from all workers. "
+            "Before outputting TASK COMPLETED, confirm you received results from all workers. "
             "Do not manually re-verify their work - the screenshots they provide show their completed work. "
             "If all workers reported success, the task is complete."
         )
@@ -308,7 +308,7 @@ def run_fork_agent(
         "the same Google Workspace URL simultaneously and see each other's changes live - like a team collaborating "
         "on a shared document. Use this for parallel work on the same file.\n"
         "\n"
-        "Google Workspace: Do not use Extensions > Apps Script - complete tasks through the UI directly.\n"
+        "Google Workspace: No scripting - complete tasks through the UI directly.\n"
         "\n"
         "Google Sheets: Arrow keys work for navigation. If clicks aren't selecting cells reliably, "
         "use the Name Box (top-left, shows current cell) - click it, type cell address (e.g., 'B3'), press Enter. "
@@ -316,14 +316,14 @@ def run_fork_agent(
         "\n"
         "**Parallelization is cheap for Google Sheets**: Opening the same sheet URL in a new display costs only 1 action. "
         "If you have 3+ actions to take on a sheet, parallelize from the beginning by forking workers for independent "
-        "regions (different columns, rows, or sheets). Don't do work sequentially if it can be divided - the setup cost "
-        "is so low that even small workloads benefit from parallelization.\n"
+        "regions (different columns, rows, subrows, subcolumns, cell regions, or sheets). Don't do work sequentially "
+        "if it can be divided - the setup cost is so low that even small workloads benefit from parallelization.\n"
         "\n"
     )
 
     system_prompt += (
-        "When you complete your task, output DONE followed by a summary. "
-        "Output FAIL if the task is impossible. "
+        "When you complete your task, output TASK COMPLETED followed by a summary. "
+        "Output TASK FAILED if the task is impossible. "
         "You are judged on both task completion and efficiency - complete tasks quickly with minimal steps."
     )
 
@@ -708,12 +708,11 @@ def run_fork_agent(
             # Continue to next step to get agent's response to tool results
             continue
 
-        # Check for DONE/FAIL (strict: must be first line)
+        # Check for TASK COMPLETED/TASK FAILED (anywhere in response)
         import re
-        first_line = final_response_text.strip().split('\n')[0].strip()
 
-        if re.match(r'^DONE(?:\s*$|[\s:.\-])', first_line, re.IGNORECASE):
-            logger.info(f"{tag} DONE at step {step}")
+        if re.search(r'TASK\s+COMPLETED', final_response_text, re.IGNORECASE):
+            logger.info(f"{tag} TASK COMPLETED at step {step}")
             duration = time.time() - start_time
             result = {
                 "status": "DONE",
@@ -724,8 +723,8 @@ def run_fork_agent(
             runtime.complete_agent(agent_id, result=result)
             return result
 
-        if re.match(r'^FAIL(?:\s*$|[\s:.\-])', first_line, re.IGNORECASE):
-            logger.info(f"{tag} FAIL at step {step}")
+        if re.search(r'TASK\s+FAILED', final_response_text, re.IGNORECASE):
+            logger.info(f"{tag} TASK FAILED at step {step}")
             duration = time.time() - start_time
             result = {
                 "status": "FAIL",
