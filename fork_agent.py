@@ -109,6 +109,31 @@ PEEK_CHILD_TOOL: Dict[str, Any] = {
     },
 }
 
+MESSAGE_CHILD_TOOL: Dict[str, Any] = {
+    "name": "message_child",
+    "description": (
+        "Send a message to a child agent to provide hints, clarifications, or updates. "
+        "The message will appear in the child's next turn as guidance from the coordinator. "
+        "Use this when you notice a child struggling or when one child discovers something "
+        "useful that could help others (e.g., where a UI button is located, a successful approach). "
+        "You can message a specific child or use 'all' to broadcast to all active children."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "child_id": {
+                "type": "string",
+                "description": "ID of the child agent to message, or 'all' to broadcast to all children",
+            },
+            "message": {
+                "type": "string",
+                "description": "The guidance message to send to the child(ren)",
+            },
+        },
+        "required": ["child_id", "message"],
+    },
+}
+
 
 def compress_context(messages: List[Dict[str, Any]]) -> str:
     """Compress agent conversation history to text-only summary.
@@ -256,6 +281,9 @@ def run_fork_agent(
             "\n"
             "Use peek_child to monitor worker progress. Results automatically appear in your next observation when workers complete.\n"
             "\n"
+            "Use message_child to send hints or guidance to workers. If one worker discovers something useful (like where a UI element is located), "
+            "you can broadcast that tip to all workers or send it to specific workers who might benefit.\n"
+            "\n"
             "Your workers are capable - trust their results and use them to reduce your workload rather than re-doing their research.\n"
             "\n"
             "Before outputting DONE, remind yourself what the original task was and check you've actually completed it. "
@@ -292,6 +320,7 @@ def run_fork_agent(
             FORK_TOOL,
             KILL_CHILD_TOOL,
             PEEK_CHILD_TOOL,
+            MESSAGE_CHILD_TOOL,
         ]
 
     # Build initial message
@@ -321,6 +350,9 @@ def run_fork_agent(
 
         # Check for child results (auto-inject)
         child_results = runtime.get_pending_child_results(agent_id)
+
+        # Check for coordinator messages (auto-inject)
+        coordinator_messages = runtime.get_pending_messages(agent_id)
 
         # Take screenshot
         shot = display.screenshot()
@@ -352,6 +384,15 @@ def run_fork_agent(
                             "text": f"Child {child_id} failed: {error}"
                         })
                         logger.info(f"{tag} ← Failure from {child_id}")
+
+            # Inject coordinator messages
+            if coordinator_messages:
+                for msg in coordinator_messages:
+                    obs_content.append({
+                        "type": "text",
+                        "text": f"[Coordinator guidance] {msg}"
+                    })
+                    logger.info(f"{tag} 📬 Received coordinator message")
 
             obs_content.append({"type": "text", "text": f"Step {step}: current desktop state."})
             # Resize screenshot from 1920×1080 to 1280×720 (computer-use calibration)
@@ -560,6 +601,45 @@ def run_fork_agent(
                     "type": "tool_result",
                     "tool_use_id": tool_use_id,
                     "content": result_content,
+                })
+
+            elif tool_name == "message_child":
+                # Send a message to child agent(s)
+                child_id = tool_input.get("child_id", "")
+                message = tool_input.get("message", "")
+
+                if not child_id or not message:
+                    result_text = "Error: Both child_id and message are required"
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": result_text,
+                    })
+                    continue
+
+                logger.info(f"{tag} Sending message to {child_id}: {message[:100]}...")
+
+                # Runtime handles message injection
+                success = runtime.message_child(
+                    parent_id=agent_id,
+                    child_id=child_id,
+                    message=message
+                )
+
+                if success:
+                    if child_id == "all":
+                        result_text = f"Message broadcast to all active children: {message}"
+                    else:
+                        result_text = f"Message sent to {child_id}: {message}"
+                else:
+                    result_text = f"Error: Cannot message {child_id} (not your child or doesn't exist)"
+
+                logger.info(f"{tag} {result_text}")
+
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": result_text,
                 })
 
             elif tool_name == "computer":
