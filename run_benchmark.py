@@ -19,7 +19,7 @@ import requests
 from agent_runtime import AgentRuntime, AgentStatus
 from bedrock_client import BedrockClient
 from fork_agent import run_fork_agent
-from google_sheets_oauth import (
+from google_workspace_oauth import (
     create_sheet_from_template_oauth,
     create_doc_from_template_oauth,
     create_slide_from_template_oauth,
@@ -48,13 +48,13 @@ def _process_google_workspace_config(task_data: Dict[str, Any]) -> Dict[str, Any
     if "config" not in task_data:
         return task_data
 
-    # Load pre-created sheet URLs if available
-    sheet_urls_file = "collaborative_sheet_urls.json"
+    # Load pre-created Workspace URLs if available
+    workspace_urls_file = "collaborative_workspace_urls.json"
     pre_created_urls = {}
-    if os.path.exists(sheet_urls_file):
-        with open(sheet_urls_file) as f:
+    if os.path.exists(workspace_urls_file):
+        with open(workspace_urls_file) as f:
             pre_created_urls = json.load(f)
-        logger.info("[setup] Loaded %d pre-created sheet URLs", len(pre_created_urls))
+        logger.info("[setup] Loaded %d pre-created Workspace URLs", len(pre_created_urls))
 
     config_items = task_data["config"]
     new_config = []
