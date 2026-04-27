@@ -61,6 +61,7 @@ def _process_google_workspace_config(task_data: Dict[str, Any]) -> Dict[str, Any
     task_id = task_data.get("id", "unknown")
     chrome_urls = []
     final_window = None  # Track which window should be in front at the end
+    last_opened_file = None  # Track last non-Chrome file opened
 
     # Process each config item
     for item in config_items:
@@ -146,6 +147,17 @@ def _process_google_workspace_config(task_data: Dict[str, Any]) -> Dict[str, Any
             if params.get("open_in_chrome", False):
                 chrome_urls.append(doc_url)
 
+        elif item_type == "open":
+            # Track last opened file (in case we need to activate it at the end)
+            path = item.get("parameters", {}).get("path", "")
+            if path:
+                # Extract filename for window matching
+                import os as _os
+                filename = _os.path.basename(path)
+                # Common window title patterns: "filename - app" or just "filename"
+                last_opened_file = filename
+            new_config.append(item)
+
         elif item_type == "activate_window":
             # Remember the last window to activate (we'll do it at the end)
             final_window = item.get("parameters", {}).get("window_name")
@@ -172,11 +184,22 @@ def _process_google_workspace_config(task_data: Dict[str, Any]) -> Dict[str, Any
             "parameters": {"urls_to_open": chrome_urls}
         })
 
-    # Add final window activation (brings non-Chrome window to front)
+    # Add final window activation to control what's visible to the agent
+    # Priority: explicit activate_window > last opened file > Chrome
     if final_window:
         new_config.append({
             "type": "activate_window",
             "parameters": {"window_name": final_window, "strict": True}
+        })
+    elif last_opened_file:
+        new_config.append({
+            "type": "activate_window",
+            "parameters": {"window_name": last_opened_file, "strict": False}
+        })
+    else:
+        new_config.append({
+            "type": "activate_window",
+            "parameters": {"window_name": "Chrome", "strict": False}
         })
 
     # Replace placeholders in instruction
