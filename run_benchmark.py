@@ -22,6 +22,7 @@ from fork_agent import run_fork_agent
 from google_sheets_oauth import (
     create_sheet_from_template_oauth,
     create_doc_from_template_oauth,
+    create_slide_from_template_oauth,
     get_sheet_id_from_url,
     reset_sheet_from_template,
 )
@@ -146,6 +147,35 @@ def _process_google_workspace_config(task_data: Dict[str, Any]) -> Dict[str, Any
             # Add to Chrome URLs if requested
             if params.get("open_in_chrome", False):
                 chrome_urls.append(doc_url)
+
+        elif item_type == "google_slide_from_template":
+            params = item["parameters"]
+            template_url = params["template_url"]
+            placeholder = params.get("placeholder", "{SLIDE_URL}")
+            title = params.get("title", f"OSWorld Task Slides {task_id}")
+            client_secret_path = params.get("client_secret_path", "oauth_client_secret.json")
+            token_path = params.get("token_path", "oauth_token.pickle")
+
+            logger.info("[setup] Creating Google Slides from template: %s", template_url)
+            slide_url = create_slide_from_template_oauth(
+                template_url=template_url,
+                client_secret_path=client_secret_path,
+                token_path=token_path,
+                title=title
+            )
+            logger.info("[setup] Created slides: %s", slide_url)
+            replacements[placeholder] = slide_url
+
+            # Update evaluator
+            if "evaluator" in task_data and "result" in task_data["evaluator"]:
+                result_config = task_data["evaluator"]["result"]
+                if result_config.get("type") == "google_slide":
+                    slide_id = get_sheet_id_from_url(slide_url)
+                    result_config["slide_id"] = slide_id
+
+            # Add to Chrome URLs if requested
+            if params.get("open_in_chrome", False):
+                chrome_urls.append(slide_url)
 
         elif item_type == "open":
             # Track last opened file (in case we need to activate it at the end)
