@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import time
@@ -933,6 +934,15 @@ def main() -> None:
                 os.path.abspath(args.result_dir), f"trial_{trial_idx}", task_id
             )
             os.makedirs(trial_output_dir, exist_ok=True)
+
+            # Clear cache before each trial to prevent cross-trial contamination
+            cache_dir = f"cache/{task_id}"
+            if os.path.exists(cache_dir):
+                if not args.dry_run:
+                    shutil.rmtree(cache_dir)
+                    logger.info("Cleared cache for task %s (trial %d)", task_id, trial_idx)
+                else:
+                    logger.info("[dry-run] Would clear cache for task %s", task_id)
 
             # Build and run the command
             run_cmd = build_run_cmd(task_id, trial_output_dir, args)
