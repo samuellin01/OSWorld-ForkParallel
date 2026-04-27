@@ -242,6 +242,15 @@
       "status": "active",
       "baseline_time_seconds": null,
       "description": "Download and compress image to under 600KB using GIMP"
+    },
+    "05dd4c1d-collaborative": {
+      "name": "slides_text_alignment",
+      "osworld_original": "05dd4c1d-c489-4c85-8389-a7836c4f0567",
+      "config_file": "tasks/05dd4c1d-collaborative.json",
+      "type": "google_slide",
+      "status": "active",
+      "baseline_time_seconds": null,
+      "description": "Align textboxes on slides 3/4/5 (right/center/left) in Google Slides"
     }
   },
   "metadata": {
