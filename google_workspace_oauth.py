@@ -425,3 +425,147 @@ def create_slide_from_template_oauth(
         # Clean up temp file
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
+
+
+def reset_doc_from_template(
+    doc_url: str,
+    template_url: str,
+    client_secret_path: str = "oauth_client_secret.json",
+    token_path: str = "oauth_token.pickle",
+) -> bool:
+    """Reset an existing Google Doc to template state.
+
+    Replaces the entire content of an existing doc with fresh template data.
+    The URL stays the same, permissions persist.
+
+    Args:
+        doc_url: URL of existing Google Doc to reset
+        template_url: URL to download .docx template from
+        client_secret_path: Path to OAuth client secret JSON
+        token_path: Path to save/load OAuth refresh token
+
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    logger.info("[docs-oauth] Resetting doc to template state")
+    logger.info("[docs-oauth]   Doc URL: %s", doc_url)
+    logger.info("[docs-oauth]   Template: %s", template_url)
+
+    # Extract doc ID from URL
+    doc_id = get_sheet_id_from_url(doc_url)
+
+    # Download template .docx
+    logger.info("[docs-oauth] Downloading template")
+    response = requests.get(template_url, stream=True)
+    response.raise_for_status()
+
+    # Save to temporary file
+    with tempfile.NamedTemporaryFile(suffix='.docx', delete=False) as tmp:
+        for chunk in response.iter_content(chunk_size=8192):
+            if chunk:
+                tmp.write(chunk)
+        tmp_path = tmp.name
+
+    try:
+        # Get OAuth credentials
+        creds = _get_oauth_credentials(client_secret_path, token_path)
+        drive_service = build('drive', 'v3', credentials=creds)
+
+        logger.info("[docs-oauth] Replacing doc content via Drive API")
+
+        # Replace the entire file content
+        with open(tmp_path, 'rb') as fh:
+            media = MediaIoBaseUpload(
+                io.BytesIO(fh.read()),
+                mimetype='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                resumable=True
+            )
+
+            drive_service.files().update(
+                fileId=doc_id,
+                media_body=media,
+            ).execute()
+
+        logger.info("[docs-oauth] ✓ Doc reset successful")
+        return True
+
+    except Exception as e:
+        logger.error(f"[docs-oauth] Failed to reset doc: {e}")
+        return False
+
+    finally:
+        # Clean up temp file
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+def reset_slide_from_template(
+    slide_url: str,
+    template_url: str,
+    client_secret_path: str = "oauth_client_secret.json",
+    token_path: str = "oauth_token.pickle",
+) -> bool:
+    """Reset an existing Google Slides to template state.
+
+    Replaces the entire content of existing slides with fresh template data.
+    The URL stays the same, permissions persist.
+
+    Args:
+        slide_url: URL of existing Google Slides to reset
+        template_url: URL to download .pptx template from
+        client_secret_path: Path to OAuth client secret JSON
+        token_path: Path to save/load OAuth refresh token
+
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    logger.info("[slides-oauth] Resetting slides to template state")
+    logger.info("[slides-oauth]   Slides URL: %s", slide_url)
+    logger.info("[slides-oauth]   Template: %s", template_url)
+
+    # Extract slide ID from URL
+    slide_id = get_sheet_id_from_url(slide_url)
+
+    # Download template .pptx
+    logger.info("[slides-oauth] Downloading template")
+    response = requests.get(template_url, stream=True)
+    response.raise_for_status()
+
+    # Save to temporary file
+    with tempfile.NamedTemporaryFile(suffix='.pptx', delete=False) as tmp:
+        for chunk in response.iter_content(chunk_size=8192):
+            if chunk:
+                tmp.write(chunk)
+        tmp_path = tmp.name
+
+    try:
+        # Get OAuth credentials
+        creds = _get_oauth_credentials(client_secret_path, token_path)
+        drive_service = build('drive', 'v3', credentials=creds)
+
+        logger.info("[slides-oauth] Replacing slides content via Drive API")
+
+        # Replace the entire file content
+        with open(tmp_path, 'rb') as fh:
+            media = MediaIoBaseUpload(
+                io.BytesIO(fh.read()),
+                mimetype='application/vnd.openxmlformats-officedocument.presentationml.presentation',
+                resumable=True
+            )
+
+            drive_service.files().update(
+                fileId=slide_id,
+                media_body=media,
+            ).execute()
+
+        logger.info("[slides-oauth] ✓ Slides reset successful")
+        return True
+
+    except Exception as e:
+        logger.error(f"[slides-oauth] Failed to reset slides: {e}")
+        return False
+
+    finally:
+        # Clean up temp file
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
