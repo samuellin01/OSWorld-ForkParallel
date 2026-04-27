@@ -300,6 +300,8 @@ def run_fork_agent(
         "the same Google Workspace URL simultaneously and see each other's changes live - like a team collaborating "
         "on a shared document. Use this for parallel work on the same file.\n"
         "\n"
+        "Google Workspace: Do not use Extensions > Apps Script - complete tasks through the UI directly.\n"
+        "\n"
         "Google Sheets: Arrow keys work for navigation. If clicks aren't selecting cells reliably, "
         "use the Name Box (top-left, shows current cell) - click it, type cell address (e.g., 'B3'), press Enter. "
         "Batch actions together - if you can fill multiple cells in one operation, do so instead of one action per cell. "
