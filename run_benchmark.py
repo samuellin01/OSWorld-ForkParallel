@@ -25,6 +25,8 @@ from google_workspace_oauth import (
     create_slide_from_template_oauth,
     get_sheet_id_from_url,
     reset_sheet_from_template,
+    reset_doc_from_template,
+    reset_slide_from_template,
 )
 
 logging.basicConfig(
@@ -127,14 +129,36 @@ def _process_google_workspace_config(task_data: Dict[str, Any]) -> Dict[str, Any
             client_secret_path = params.get("client_secret_path", "oauth_client_secret.json")
             token_path = params.get("token_path", "oauth_token.pickle")
 
-            logger.info("[setup] Creating Google Doc from template: %s", template_url)
-            doc_url = create_doc_from_template_oauth(
-                template_url=template_url,
-                client_secret_path=client_secret_path,
-                token_path=token_path,
-                title=title
-            )
-            logger.info("[setup] Created doc: %s", doc_url)
+            # Create/reset doc
+            if task_id in pre_created_urls:
+                doc_url = pre_created_urls[task_id]
+                logger.info("[setup] Using pre-created doc: %s", doc_url)
+                logger.info("[setup] Resetting doc to template state...")
+                success = reset_doc_from_template(
+                    doc_url=doc_url,
+                    template_url=template_url,
+                    client_secret_path=client_secret_path,
+                    token_path=token_path,
+                )
+                if not success:
+                    logger.warning("[setup] Reset failed, creating new doc instead")
+                    doc_url = create_doc_from_template_oauth(
+                        template_url=template_url,
+                        client_secret_path=client_secret_path,
+                        token_path=token_path,
+                        title=title
+                    )
+                    logger.info("[setup] Created new doc: %s", doc_url)
+            else:
+                logger.info("[setup] Creating Google Doc from template: %s", template_url)
+                doc_url = create_doc_from_template_oauth(
+                    template_url=template_url,
+                    client_secret_path=client_secret_path,
+                    token_path=token_path,
+                    title=title
+                )
+                logger.info("[setup] Created doc: %s", doc_url)
+
             replacements[placeholder] = doc_url
 
             # Update evaluator
@@ -156,14 +180,36 @@ def _process_google_workspace_config(task_data: Dict[str, Any]) -> Dict[str, Any
             client_secret_path = params.get("client_secret_path", "oauth_client_secret.json")
             token_path = params.get("token_path", "oauth_token.pickle")
 
-            logger.info("[setup] Creating Google Slides from template: %s", template_url)
-            slide_url = create_slide_from_template_oauth(
-                template_url=template_url,
-                client_secret_path=client_secret_path,
-                token_path=token_path,
-                title=title
-            )
-            logger.info("[setup] Created slides: %s", slide_url)
+            # Create/reset slides
+            if task_id in pre_created_urls:
+                slide_url = pre_created_urls[task_id]
+                logger.info("[setup] Using pre-created slides: %s", slide_url)
+                logger.info("[setup] Resetting slides to template state...")
+                success = reset_slide_from_template(
+                    slide_url=slide_url,
+                    template_url=template_url,
+                    client_secret_path=client_secret_path,
+                    token_path=token_path,
+                )
+                if not success:
+                    logger.warning("[setup] Reset failed, creating new slides instead")
+                    slide_url = create_slide_from_template_oauth(
+                        template_url=template_url,
+                        client_secret_path=client_secret_path,
+                        token_path=token_path,
+                        title=title
+                    )
+                    logger.info("[setup] Created new slides: %s", slide_url)
+            else:
+                logger.info("[setup] Creating Google Slides from template: %s", template_url)
+                slide_url = create_slide_from_template_oauth(
+                    template_url=template_url,
+                    client_secret_path=client_secret_path,
+                    token_path=token_path,
+                    title=title
+                )
+                logger.info("[setup] Created slides: %s", slide_url)
+
             replacements[placeholder] = slide_url
 
             # Update evaluator
