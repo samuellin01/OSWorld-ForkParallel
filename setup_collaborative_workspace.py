@@ -1,17 +1,17 @@
-"""One-time setup: Create Google Sheets for all collaborative tasks.
+"""One-time setup: Create Google Workspace files for all collaborative tasks.
 
-This script creates 27 Google Sheets (one per collaborative task) and saves
-their URLs to collaborative_sheet_urls.json. After running this once, you can
-run collaborative tasks infinitely without creating new sheets.
+This script creates Google Sheets/Docs/Slides for collaborative tasks and saves
+their URLs to collaborative_workspace_urls.json. After running this once, you can
+run collaborative tasks infinitely without creating new files.
 
 Usage:
-    python setup_collaborative_sheets.py
+    python setup_collaborative_workspace.py
 
 The script will:
 1. Load collaborative task metadata
-2. Create a Google Sheet for each task from its template
+2. Create Google Sheets/Docs/Slides for each task from templates
 3. Set permissions to "anyone with link can edit"
-4. Save URLs to collaborative_sheet_urls.json
+4. Save URLs to collaborative_workspace_urls.json
 
 You'll need:
 - oauth_client_secret.json (Google OAuth credentials)
@@ -24,7 +24,11 @@ import logging
 import os
 import time
 
-from google_sheets_oauth import create_sheet_from_template_oauth
+from google_workspace_oauth import (
+    create_sheet_from_template_oauth,
+    create_doc_from_template_oauth,
+    create_slide_from_template_oauth,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Pre-create Google Sheets for collaborative tasks")
+    parser = argparse.ArgumentParser(description="Pre-create Google Workspace files for collaborative tasks")
     parser.add_argument(
         "--config-file",
         default="evaluation_examples/collaborative_task_configs.json",
@@ -42,8 +46,8 @@ def main():
     )
     parser.add_argument(
         "--output-file",
-        default="collaborative_sheet_urls.json",
-        help="Where to save sheet URLs"
+        default="collaborative_workspace_urls.json",
+        help="Where to save Workspace file URLs"
     )
     parser.add_argument(
         "--client-secret",
@@ -92,23 +96,23 @@ def main():
 
     logger.info(f"Found {len(active_tasks)} active collaborative tasks")
 
-    # Load existing sheet URLs if they exist
-    sheet_urls = {}
+    # Load existing workspace URLs if they exist
+    workspace_urls = {}
     if os.path.exists(args.output_file) and not args.force:
-        logger.info(f"\nLoading existing sheet URLs from {args.output_file}")
+        logger.info(f"\nLoading existing Workspace URLs from {args.output_file}")
         with open(args.output_file) as f:
-            sheet_urls = json.load(f)
-        logger.info(f"Found {len(sheet_urls)} existing sheets")
-        if len(sheet_urls) == len(active_tasks):
-            logger.info("\n✓ All sheets already created!")
+            workspace_urls = json.load(f)
+        logger.info(f"Found {len(workspace_urls)} existing Workspace files")
+        if len(workspace_urls) == len(active_tasks):
+            logger.info("\n✓ All Workspace files already created!")
             logger.info(f"URLs saved in: {args.output_file}")
-            logger.info(f"\nTo recreate all sheets, use: --force")
+            logger.info(f"\nTo recreate all files, use: --force")
             logger.info(f"\nYou can now run collaborative tasks:")
             logger.info(f"  python run_benchmark.py --task-type collaborative --num-tasks 10 ...")
             return
-        logger.info(f"Will create {len(active_tasks) - len(sheet_urls)} missing sheets")
+        logger.info(f"Will create {len(active_tasks) - len(workspace_urls)} missing files")
     elif args.force:
-        logger.info(f"\n--force flag set: will recreate all sheets")
+        logger.info(f"\n--force flag set: will recreate all Workspace files")
 
     # Load task details to get templates
     total = len(active_tasks)
@@ -129,63 +133,86 @@ def main():
         with open(task_file) as f:
             task_data = json.load(f)
 
-        # Find google_sheet_from_template config step
-        config_steps = task_data.get("config", [])
-        sheet_config = None
+        # Find Google Workspace config step (sheet/doc/slide)
+        config_steps = task_data.get("specific", {}).get("google_account", {}).get("config", [])
+        workspace_config = None
+        workspace_type = None
+
         for step in config_steps:
-            if step.get("type") == "google_sheet_from_template":
-                sheet_config = step
+            step_type = step.get("type")
+            if step_type in ("google_sheet_from_template", "google_doc_from_template", "google_slide_from_template"):
+                workspace_config = step
+                workspace_type = step_type
                 break
 
-        if not sheet_config:
-            logger.warning(f"No google_sheet_from_template found for {task_id}, skipping")
+        if not workspace_config:
+            logger.warning(f"No Google Workspace config found for {task_id}, skipping")
             continue
 
-        params = sheet_config["parameters"]
+        params = workspace_config["parameters"]
         template_url = params["template_url"]
         title = params.get("title", f"OSWorld Task {task_id}")
 
+        logger.info(f"Type: {workspace_type}")
         logger.info(f"Template: {template_url[:80]}...")
         logger.info(f"Title: {title}")
 
-        # Check if sheet already exists (unless --force)
-        if task_id in sheet_urls and not args.force:
-            logger.info(f"⊙ Already exists: {sheet_urls[task_id]}")
+        # Check if file already exists (unless --force)
+        if task_id in workspace_urls and not args.force:
+            logger.info(f"⊙ Already exists: {workspace_urls[task_id]}")
             logger.info(f"   Skipping (use --force to recreate)")
             skipped_count += 1
             continue
 
-        # Create sheet
+        # Create Workspace file based on type
         try:
-            sheet_url = create_sheet_from_template_oauth(
-                template_url=template_url,
-                client_secret_path=args.client_secret,
-                token_path=args.token,
-                title=title
-            )
+            if workspace_type == "google_sheet_from_template":
+                file_url = create_sheet_from_template_oauth(
+                    template_url=template_url,
+                    client_secret_path=args.client_secret,
+                    token_path=args.token,
+                    title=title
+                )
+            elif workspace_type == "google_doc_from_template":
+                file_url = create_doc_from_template_oauth(
+                    template_url=template_url,
+                    client_secret_path=args.client_secret,
+                    token_path=args.token,
+                    title=title
+                )
+            elif workspace_type == "google_slide_from_template":
+                file_url = create_slide_from_template_oauth(
+                    template_url=template_url,
+                    client_secret_path=args.client_secret,
+                    token_path=args.token,
+                    title=title
+                )
+            else:
+                logger.error(f"Unknown workspace type: {workspace_type}")
+                continue
 
-            sheet_urls[task_id] = sheet_url
-            logger.info(f"✓ Created: {sheet_url}")
+            workspace_urls[task_id] = file_url
+            logger.info(f"✓ Created: {file_url}")
             created_count += 1
 
             # Save progress incrementally
             with open(args.output_file, 'w') as f:
-                json.dump(sheet_urls, f, indent=2)
+                json.dump(workspace_urls, f, indent=2)
 
             # Rate limiting
             if idx < total:
-                logger.info(f"Waiting {args.delay}s before next sheet...")
+                logger.info(f"Waiting {args.delay}s before next file...")
                 time.sleep(args.delay)
 
         except Exception as e:
-            logger.error(f"✗ Failed to create sheet for {task_id}: {e}")
+            logger.error(f"✗ Failed to create file for {task_id}: {e}")
             continue
 
     # Final summary
     logger.info(f"\n{'='*70}")
     logger.info("SETUP COMPLETE")
     logger.info(f"{'='*70}")
-    logger.info(f"Total sheets: {len(sheet_urls)}/{total}")
+    logger.info(f"Total Workspace files: {len(workspace_urls)}/{total}")
     if created_count > 0:
         logger.info(f"  Created: {created_count}")
     if skipped_count > 0:
