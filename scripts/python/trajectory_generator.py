@@ -447,7 +447,7 @@ def generate_trajectory_html(
             return 'message'
         elif tool_name == 'peek_child' or action_text.startswith('Peek at'):
             return 'peek'
-        elif action_text.startswith('DONE') or action_text.startswith('TASK COMPLETED'):
+        elif 'SUBTASK COMPLETE' in action_text or action_text.startswith('DONE') or action_text.startswith('TASK COMPLETED'):
             return 'report'
         else:
             return 'action'
