@@ -1,13 +1,15 @@
 """Batch evaluation script for running the baseline AnthropicAgent
-(run_baseline_task.py) across all tasks in a domain and uploading results
-to GitHub.
+(run_baseline_task.py) across all tasks and uploading results to GitHub.
 
 Example usage:
 
-    # Run all multi_apps tasks (skips tasks already in results.json):
+    # Run all collaborative tasks (skips tasks already in results.json):
     python scripts/python/run_batch_osworld_baseline.py
 
-    # Run chrome tasks:
+    # Run standard tasks:
+    python scripts/python/run_batch_osworld_baseline.py --task-type standard
+
+    # Run collaborative tasks with domain filter:
     python scripts/python/run_batch_osworld_baseline.py --domain chrome
 
     # Force re-run tasks that already have results:
@@ -85,19 +87,25 @@ def parse_args() -> argparse.Namespace:
         description="Batch evaluation of CUA agent on OSWorld tasks."
     )
 
-    # Task / domain selection
+    # Task / task_type selection
     parser.add_argument(
-        "--domain",
+        "--task-type",
         type=str,
-        default="multi_apps",
-        help="Domain subdirectory under evaluation_examples/examples/ (default: multi_apps)",
+        default="collaborative",
+        choices=["standard", "collaborative"],
+        help="Task type: standard or collaborative (default: collaborative)",
+    )
+    parser.add_argument(
+        "--task_type",
+        type=str,
+        default=None,
+        help="Domain filter (e.g., chrome, multi_apps, all). If omitted, all tasks are run.",
     )
     parser.add_argument(
         "--task_ids",
         nargs="+",
         default=None,
-        help="Optional list of specific task IDs to run. If omitted, all task IDs in the "
-             "domain directory are discovered automatically.",
+        help="Optional list of specific task IDs to run. If omitted, all task IDs are discovered.",
     )
 
     # Agent / model config
@@ -176,8 +184,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--result_dir",
         type=str,
-        default="./task_results",
-        help="Local results directory (default: ./task_results).",
+        default="./batch_results",
+        help="Local results directory (default: ./batch_results).",
+    )
+    parser.add_argument(
+        "--test_file",
+        type=str,
+        default=None,
+        help="Specific test file to use (e.g., test_all.json, test_small.json). Default: auto-detect",
     )
     parser.add_argument(
         "--test_config_base_dir",
@@ -282,9 +296,11 @@ def refresh_aws_credentials() -> None:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def fetch_existing_results(args: argparse.Namespace) -> dict[str, float | None]:
-    """Fetch the existing results.json from GitHub and return the scores for
-    the current config_name.  Returns an empty dict on any failure."""
+def fetch_existing_results(args: argparse.Namespace) -> dict[str, dict]:
+    """Fetch existing results.json from GitHub for the current config_name.
+
+    Format: {config: {task_type: {task_id: {trial_N: score}}}}
+    """
     token = os.environ.get("GITHUB_TOKEN")
     if not token:
         return {}
@@ -312,14 +328,10 @@ def fetch_existing_results(args: argparse.Namespace) -> dict[str, float | None]:
             content_b64 = resp_data.get("content", "")
             data = json.loads(base64.b64decode(content_b64).decode("utf-8"))
             config_data = data.get(args.config_name, {})
-            # Support both old flat format {task_id: score} and new nested
-            # format {domain: {task_id: score}}.
-            domain_data = config_data.get(args.domain)
-            if isinstance(domain_data, dict):
-                return domain_data
-            # Flat format — return as-is for backward compat.
-            return config_data
-    except Exception as exc:  # noqa: BLE001
+            # Format: {config: {task_type: {task_id: {trial_N: score}}}}
+            task_type_data = config_data.get(args.task_type, {})
+            return task_type_data
+    except Exception as exc:
         logger.warning("Could not fetch existing results.json: %s", exc)
         return {}
 
@@ -345,7 +357,7 @@ def get_existing_trial_numbers(
 
     api_base = f"{_GITHUB_API_BASE}/repos/{args.github_results_repo}/contents"
     github_path = (
-        f"{args.github_results_path}/{args.domain}/{task_id}/{args.config_name}"
+        f"{args.github_results_path}/{args.task_type}/{task_id}/{args.config_name}"
     )
     url = f"{api_base}/{github_path}"
     headers = {
@@ -403,21 +415,23 @@ def find_next_trial_slots(existing_trials: list[int], num_new_trials: int) -> li
     return slots
 
 
-def discover_task_ids(domain: str, test_config_base_dir: str) -> list[str]:
-    """Discover all task IDs by globbing *.json files in the domain directory."""
-    pattern = os.path.join(test_config_base_dir, "examples", domain, "*.json")
-    json_files = sorted(glob.glob(pattern))
-    if not json_files:
-        logger.warning("No JSON task files found matching pattern: %s", pattern)
-    task_ids = [os.path.splitext(os.path.basename(f))[0] for f in json_files]
-    logger.info("Discovered %d task IDs for domain '%s'.", len(task_ids), domain)
+def discover_task_ids_from_test_file(task_type: str, test_file: str | None) -> list[str]:
+    """Discover all task IDs from test JSON files."""
+    # Import from run_benchmark.py
+    repo_root = pathlib.Path(__file__).parent.parent.parent
+    sys.path.insert(0, str(repo_root))
+    from run_benchmark import load_osworld_tasks
+
+    tasks = load_osworld_tasks(task_type=task_type, test_file=test_file)
+    task_ids = [t.get("id") for t in tasks if t.get("id")]
+    logger.info("Discovered %d task IDs for task_type '%s'.", len(task_ids), task_type)
     return task_ids
 
 
 def local_result_dir(task_id: str, args: argparse.Namespace, trial: int = 1) -> str:
     """Return the expected local result directory for a task trial."""
     return os.path.join(
-        os.path.abspath(args.result_dir), f"trial_{trial}", args.domain, task_id
+        os.path.abspath(args.result_dir), f"trial_{trial}", f"task_{task_id}"
     )
 
 
@@ -433,7 +447,6 @@ def build_run_cmd(task_id: str, args: argparse.Namespace) -> list:
         sys.executable,
         run_task_path,
         "--task-id", task_id,
-        "--domain", args.domain,
         "--headless",
         "--observation-type", args.observation_type,
         "--max-steps", str(args.max_steps),
@@ -446,6 +459,8 @@ def build_run_cmd(task_id: str, args: argparse.Namespace) -> list:
         "--output-dir", result_dir,
         "--test-config-base-dir", config_base_dir,
     ]
+    if args.domain:
+        cmd += ["--domain", args.domain]
     if args.credentials_file:
         cmd += ["--credentials-file", args.credentials_file]
     return cmd
@@ -479,22 +494,30 @@ def run_subprocess(cmd: list, timeout: int, dry_run: bool, description: str) -> 
 
 
 # ---------------------------------------------------------------------------
-# Trajectory markdown generator
+# Trajectory HTML generator
 # ---------------------------------------------------------------------------
 
-def generate_trajectory_md(local_dir: str, task_id: str) -> None:
-    """Generate trajectory.md in the result directory with all screenshots and responses."""
+def generate_trajectory_html(
+    local_dir: str,
+    task_id: str,
+    github_repo: str,
+    github_path: str,
+    task_type: str,
+    config_name: str,
+    trial: int = 1,
+) -> None:
+    """Generate interactive trajectory.html for baseline (single-agent) execution."""
     local_path = pathlib.Path(local_dir)
     if not local_path.is_dir():
         return
 
-    # Read task instruction.
+    # Read task instruction
     task_txt = local_path / "task.txt"
     instruction = ""
     if task_txt.is_file():
         instruction = task_txt.read_text(encoding="utf-8", errors="replace").strip()
 
-    # Read action log for response texts.
+    # Read action log
     action_log_path = local_path / "action_log.json"
     action_log: list[dict] = []
     if action_log_path.is_file():
@@ -503,16 +526,16 @@ def generate_trajectory_md(local_dir: str, task_id: str) -> None:
         except (json.JSONDecodeError, OSError):
             pass
 
-    # Read result score.
+    # Read result score
     result_path = local_path / "result.txt"
-    score_str = "N/A"
+    score = None
     if result_path.is_file():
         try:
-            score_str = result_path.read_text(encoding="utf-8").strip()
-        except OSError:
+            score = float(result_path.read_text(encoding="utf-8").strip())
+        except (ValueError, OSError):
             pass
 
-    # Read token usage for cost and wall clock.
+    # Read token usage
     token_usage_path = local_path / "token_usage.json"
     token_usage: dict = {}
     if token_usage_path.is_file():
@@ -521,66 +544,508 @@ def generate_trajectory_md(local_dir: str, task_id: str) -> None:
         except (json.JSONDecodeError, OSError):
             pass
 
-    # Find step directories sorted by number.
+    wall_clock = token_usage.get("wall_clock_seconds") or token_usage.get("total_latency_seconds") or 0
+    cost = token_usage.get("total_cost_usd") or 0
+
+    # Find step directories
     step_dirs = sorted(
         (d for d in local_path.iterdir() if d.is_dir() and d.name.startswith("step_")),
         key=lambda d: d.name,
     )
 
-    # Format wall clock duration.
+    # Format duration helper
     def fmt_duration(secs: float) -> str:
         if secs < 60:
             return f"{secs:.0f}s"
         m, s = divmod(int(secs), 60)
         return f"{m}m {s}s"
 
-    lines: list[str] = []
-    lines.append(f"# Task {task_id}\n")
-    if instruction:
-        lines.append(f"**Instruction:** {instruction}\n")
-    lines.append(f"**Score:** {score_str}\n")
-    wall_clock = token_usage.get("wall_clock_seconds") or token_usage.get("total_latency_seconds")
-    if wall_clock is not None:
-        lines.append(f"**Wall clock:** {fmt_duration(wall_clock)}\n")
-    lines.append(f"**Steps:** {len(step_dirs)}\n")
-    cost = token_usage.get("total_cost_usd")
-    if cost is not None:
-        lines.append(f"**Cost:** ${cost:.2f}\n")
-    lines.append("---\n")
-
+    # Build step data
+    steps = []
     for step_dir in step_dirs:
-        step_name = step_dir.name  # e.g. "step_0001"
-        step_num = step_name.replace("step_", "").lstrip("0") or "0"
-        lines.append(f"## Step {step_num}\n")
+        step_name = step_dir.name
+        step_num = int(step_name.replace("step_", "").lstrip("0") or "0")
 
-        # Screenshot.
-        screenshot = step_dir / "screenshot.png"
-        if screenshot.is_file():
-            rel = screenshot.relative_to(local_path)
-            lines.append(f"![Step {step_num}]({rel})\n")
-
-        # Response text.
+        # Read thinking/response
+        thinking = ""
         response_file = step_dir / "response.txt"
         if response_file.is_file():
-            resp = response_file.read_text(encoding="utf-8", errors="replace").strip()
-            if resp:
-                lines.append(f"**Response:**\n```\n{resp}\n```\n")
+            thinking = response_file.read_text(encoding="utf-8", errors="replace").strip()
 
-        # Action from action_log.
-        step_idx = int(step_num) - 1
-        if 0 <= step_idx < len(action_log):
-            entry = action_log[step_idx]
+        # Screenshot
+        screenshot_file = step_dir / "screenshot.png"
+        screenshot_url = f"{step_name}/screenshot.png" if screenshot_file.is_file() else ""
+
+        # Action from action log
+        action = ""
+        if step_num - 1 < len(action_log):
+            entry = action_log[step_num - 1]
             actions = entry.get("actions", [])
-            action_code = entry.get("action_code")
             if actions:
-                actions_str = ", ".join(str(a)[:200] for a in actions)
-                lines.append(f"**Actions:** `{actions_str}`\n")
+                action = ", ".join(str(a) for a in actions)
 
-        lines.append("---\n")
+        steps.append({
+            'num': step_num,
+            'thinking': thinking,
+            'screenshot': screenshot_url,
+            'action': action,
+        })
 
-    md_path = local_path / "trajectory.md"
-    md_path.write_text("\n".join(lines), encoding="utf-8")
-    logger.info("Generated %s (%d steps)", md_path, len(step_dirs))
+    # Generate HTML
+    img_base = f"https://raw.githubusercontent.com/{github_repo}/main/{github_path}/{task_type}/{task_id}/{config_name}/trial_{trial}"
+
+    h = []
+    h.append("<!DOCTYPE html>")
+    h.append("<html lang='en'>")
+    h.append("<head>")
+    h.append("  <meta charset='UTF-8'>")
+    h.append("  <meta name='viewport' content='width=device-width, initial-scale=1.0'>")
+    h.append(f"  <title>Baseline Trajectory: {task_id}</title>")
+    h.append("  <style>")
+    h.append("""
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #0d1117;
+    color: #e6edf3;
+    line-height: 1.6;
+    padding: 20px;
+}
+.container {
+    max-width: 1400px;
+    margin: 0 auto;
+}
+h1 {
+    font-size: 2em;
+    margin-bottom: 20px;
+    color: #58a6ff;
+}
+.summary {
+    background: linear-gradient(135deg, #161b22 0%, #1c2128 100%);
+    border: 1px solid #30363d;
+    border-radius: 12px;
+    padding: 20px;
+    margin-bottom: 30px;
+}
+.summary-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 15px;
+    margin-top: 15px;
+}
+.summary-item {
+    background: #0d1117;
+    padding: 12px;
+    border-radius: 8px;
+    border: 1px solid #21262d;
+}
+.summary-label {
+    font-size: 0.85em;
+    color: #8b949e;
+    margin-bottom: 5px;
+}
+.summary-value {
+    font-size: 1.3em;
+    font-weight: 600;
+    color: #e6edf3;
+}
+.instruction {
+    background: #161b22;
+    padding: 15px;
+    border-radius: 8px;
+    border-left: 4px solid #58a6ff;
+    margin-top: 15px;
+    font-size: 0.95em;
+}
+.timeline-scrubber {
+    background: linear-gradient(135deg, #161b22 0%, #1c2128 100%);
+    border: 1px solid #30363d;
+    border-radius: 12px;
+    padding: 20px;
+    margin-bottom: 30px;
+}
+.timeline-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 16px;
+}
+.timeline-controls {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+.timeline-play-button {
+    background: linear-gradient(135deg, #238636 0%, #2ea043 100%);
+    border: none;
+    color: white;
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.2em;
+    transition: all 0.2s ease;
+    box-shadow: 0 2px 8px rgba(35, 134, 54, 0.3);
+}
+.timeline-play-button:hover {
+    background: linear-gradient(135deg, #2ea043 0%, #238636 100%);
+    transform: scale(1.05);
+}
+.timeline-speed-selector {
+    background: #161b22;
+    border: 1px solid #30363d;
+    color: #e6edf3;
+    padding: 6px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 0.9em;
+    font-weight: 600;
+    transition: all 0.2s ease;
+}
+.timeline-speed-selector:hover {
+    background: #21262d;
+    border-color: #58a6ff;
+}
+.timeline-time {
+    font-size: 1.4em;
+    background: linear-gradient(90deg, #58a6ff 0%, #79c0ff 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+}
+.timeline-slider {
+    width: 100%;
+    height: 20px;
+    background: #0d1117;
+    border-radius: 10px;
+    position: relative;
+    cursor: pointer;
+    border: 1px solid #21262d;
+}
+.timeline-progress {
+    position: absolute;
+    height: 100%;
+    background: linear-gradient(90deg, #238636 0%, #2ea043 100%);
+    border-radius: 10px;
+    transition: width 0.1s ease-out;
+}
+.timeline-knob {
+    position: absolute;
+    width: 16px;
+    height: 16px;
+    background: #ffffff;
+    border-radius: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    cursor: grab;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.5);
+    transition: left 0.1s ease-out;
+}
+.timeline-knob:active {
+    cursor: grabbing;
+    transform: translate(-50%, -50%) scale(1.2);
+}
+.display-panel {
+    background: linear-gradient(135deg, #161b22 0%, #1c2128 100%);
+    border: 1px solid #30363d;
+    border-radius: 12px;
+    padding: 20px;
+    margin-bottom: 30px;
+}
+.display-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 15px;
+}
+.display-step {
+    font-size: 0.9em;
+    color: #8b949e;
+}
+.display-panel img {
+    width: 100%;
+    border-radius: 8px;
+    border: 1px solid #30363d;
+    margin-bottom: 15px;
+}
+.display-panel-thinking {
+    font-size: 0.9em;
+    color: #e6edf3;
+    background: #0d1117;
+    padding: 12px;
+    border-radius: 6px;
+    border-left: 3px solid #58a6ff;
+    white-space: pre-wrap;
+    font-family: 'SF Mono', Monaco, 'Courier New', monospace;
+    line-height: 1.5;
+}
+.action-log {
+    background: linear-gradient(135deg, #161b22 0%, #1c2128 100%);
+    border: 1px solid #30363d;
+    border-radius: 12px;
+    padding: 16px;
+}
+.action-log h2 {
+    margin-bottom: 15px;
+    font-size: 1.3em;
+}
+.action-item {
+    background: #0d1117;
+    border: 1px solid #21262d;
+    border-radius: 6px;
+    padding: 10px 12px;
+    margin-bottom: 8px;
+    display: grid;
+    grid-template-columns: 80px 1fr;
+    gap: 12px;
+    font-size: 0.9em;
+}
+.action-step {
+    color: #8b949e;
+    font-weight: 600;
+}
+.action-detail {
+    color: #e6edf3;
+    font-family: 'SF Mono', Monaco, monospace;
+}
+""")
+    h.append("  </style>")
+    h.append("</head>")
+    h.append("<body>")
+    h.append("  <div class='container'>")
+    h.append(f"    <h1>Baseline Trajectory: {task_id}</h1>")
+
+    # Summary
+    h.append("    <div class='summary'>")
+    h.append("      <div class='summary-grid'>")
+    h.append("        <div class='summary-item'>")
+    h.append("          <div class='summary-label'>Score</div>")
+    h.append(f"          <div class='summary-value'>{score if score is not None else 'N/A'}</div>")
+    h.append("        </div>")
+    h.append("        <div class='summary-item'>")
+    h.append("          <div class='summary-label'>Duration</div>")
+    h.append(f"          <div class='summary-value'>{fmt_duration(wall_clock)}</div>")
+    h.append("        </div>")
+    h.append("        <div class='summary-item'>")
+    h.append("          <div class='summary-label'>Steps</div>")
+    h.append(f"          <div class='summary-value'>{len(steps)}</div>")
+    h.append("        </div>")
+    h.append("        <div class='summary-item'>")
+    h.append("          <div class='summary-label'>Cost</div>")
+    h.append(f"          <div class='summary-value'>${cost:.2f}</div>")
+    h.append("        </div>")
+    h.append("      </div>")
+    if instruction:
+        h.append(f"      <div class='instruction'>{instruction}</div>")
+    h.append("    </div>")
+
+    # Timeline scrubber
+    h.append("    <div class='timeline-scrubber'>")
+    h.append("      <h2>⏱️ Execution Timeline</h2>")
+    h.append("      <div class='timeline-header'>")
+    h.append("        <div class='timeline-controls'>")
+    h.append("          <button class='timeline-play-button' id='timeline-play-button' title='Play/Pause'>▶️</button>")
+    h.append("          <select class='timeline-speed-selector' id='timeline-speed-selector'>")
+    h.append("            <option value='1'>1x</option>")
+    h.append("            <option value='2'>2x</option>")
+    h.append("            <option value='4' selected>4x</option>")
+    h.append("            <option value='8'>8x</option>")
+    h.append("            <option value='16'>16x</option>")
+    h.append("          </select>")
+    h.append("          <div class='timeline-time' id='timeline-time'>Step 0</div>")
+    h.append("        </div>")
+    h.append(f"        <div style='color:#8b949e;font-size:0.85em'>Total: {len(steps)} steps</div>")
+    h.append("      </div>")
+    h.append("      <div class='timeline-slider' id='timeline-slider'>")
+    h.append("        <div class='timeline-progress' id='timeline-progress' style='width: 0%'></div>")
+    h.append("        <div class='timeline-knob' id='timeline-knob' style='left: 0%'></div>")
+    h.append("      </div>")
+    h.append("    </div>")
+
+    # Display panel
+    h.append("    <div class='display-panel'>")
+    h.append("      <div class='display-header'>")
+    h.append("        <h2>📺 Display</h2>")
+    h.append("        <div class='display-step' id='display-step'>Step —</div>")
+    h.append("      </div>")
+    h.append("      <img id='display-img' src='' alt='No screenshot' style='display:none'>")
+    h.append("      <div id='display-thinking' class='display-panel-thinking' style='display:none'></div>")
+    h.append("    </div>")
+
+    # Action log
+    h.append("    <div class='action-log'>")
+    h.append("      <h2>📋 Action Log</h2>")
+    for i, step in enumerate(steps):
+        h.append("      <div class='action-item'>")
+        h.append(f"        <div class='action-step'>Step {step['num']}</div>")
+        h.append(f"        <div class='action-detail'>{step['action'] if step['action'] else '—'}</div>")
+        h.append("      </div>")
+    h.append("    </div>")
+
+    h.append("  </div>")
+
+    # JavaScript
+    h.append("  <script>")
+    h.append(f"const steps = {json.dumps(steps)};")
+    h.append(f"const imgBase = '{img_base}';")
+    h.append("""
+let currentStepIndex = 0;
+let isPlaying = false;
+let animationId = null;
+let lastFrameTime = null;
+let playbackSpeed = 4;
+
+function updateDisplay(stepIndex) {
+    currentStepIndex = Math.max(0, Math.min(stepIndex, steps.length - 1));
+    const step = steps[currentStepIndex];
+
+    document.getElementById('timeline-time').textContent = 'Step ' + step.num;
+
+    const progress = (currentStepIndex / (steps.length - 1)) * 100;
+    document.getElementById('timeline-progress').style.width = progress + '%';
+    document.getElementById('timeline-knob').style.left = progress + '%';
+
+    const imgEl = document.getElementById('display-img');
+    const stepEl = document.getElementById('display-step');
+    const thinkingEl = document.getElementById('display-thinking');
+
+    stepEl.textContent = 'Step ' + step.num;
+
+    if (step.screenshot) {
+        imgEl.src = imgBase + '/' + step.screenshot;
+        imgEl.style.display = 'block';
+    } else {
+        imgEl.style.display = 'none';
+    }
+
+    if (step.thinking) {
+        thinkingEl.textContent = step.thinking;
+        thinkingEl.style.display = 'block';
+    } else {
+        thinkingEl.style.display = 'none';
+    }
+}
+
+function animate(timestamp) {
+    if (!isPlaying) return;
+
+    if (lastFrameTime === null) {
+        lastFrameTime = timestamp;
+    }
+
+    const deltaTime = (timestamp - lastFrameTime) / 1000;
+    lastFrameTime = timestamp;
+
+    const stepsPerSecond = playbackSpeed;
+    const newIndex = currentStepIndex + (deltaTime * stepsPerSecond);
+
+    if (newIndex >= steps.length - 1) {
+        isPlaying = false;
+        updateDisplay(steps.length - 1);
+        document.getElementById('timeline-play-button').textContent = '▶️';
+        lastFrameTime = null;
+    } else {
+        updateDisplay(Math.floor(newIndex));
+        animationId = requestAnimationFrame(animate);
+    }
+}
+
+function togglePlay() {
+    isPlaying = !isPlaying;
+    const button = document.getElementById('timeline-play-button');
+
+    if (isPlaying) {
+        button.textContent = '⏸️';
+        if (currentStepIndex >= steps.length - 1) {
+            updateDisplay(0);
+        }
+        lastFrameTime = null;
+        animationId = requestAnimationFrame(animate);
+    } else {
+        button.textContent = '▶️';
+        if (animationId) {
+            cancelAnimationFrame(animationId);
+            animationId = null;
+        }
+        lastFrameTime = null;
+    }
+}
+
+document.getElementById('timeline-play-button').addEventListener('click', togglePlay);
+
+document.getElementById('timeline-speed-selector').addEventListener('change', (e) => {
+    playbackSpeed = parseFloat(e.target.value);
+});
+
+const slider = document.getElementById('timeline-slider');
+const knob = document.getElementById('timeline-knob');
+
+function seekToPosition(clientX) {
+    const rect = slider.getBoundingClientRect();
+    const x = Math.max(0, Math.min(clientX - rect.left, rect.width));
+    const percent = x / rect.width;
+    const stepIndex = Math.floor(percent * (steps.length - 1));
+    updateDisplay(stepIndex);
+}
+
+slider.addEventListener('click', (e) => {
+    if (e.target === slider || e.target === document.getElementById('timeline-progress')) {
+        if (isPlaying) togglePlay();
+        seekToPosition(e.clientX);
+    }
+});
+
+let isDragging = false;
+knob.addEventListener('mousedown', (e) => {
+    isDragging = true;
+    if (isPlaying) togglePlay();
+    e.preventDefault();
+});
+
+document.addEventListener('mousemove', (e) => {
+    if (isDragging) {
+        seekToPosition(e.clientX);
+    }
+});
+
+document.addEventListener('mouseup', () => {
+    isDragging = false;
+});
+
+document.addEventListener('keydown', (e) => {
+    if (e.key === ' ') {
+        e.preventDefault();
+        togglePlay();
+    } else if (e.key === 'ArrowLeft') {
+        updateDisplay(currentStepIndex - 1);
+    } else if (e.key === 'ArrowRight') {
+        updateDisplay(currentStepIndex + 1);
+    } else if (e.key === 'Home') {
+        updateDisplay(0);
+    } else if (e.key === 'End') {
+        updateDisplay(steps.length - 1);
+    }
+});
+
+// Initialize
+updateDisplay(0);
+""")
+    h.append("  </script>")
+    h.append("</body>")
+    h.append("</html>")
+
+    html_path = local_path / "trajectory.html"
+    html_path.write_text("\n".join(h), encoding="utf-8")
+    logger.info("Generated %s (%d steps)", html_path, len(steps))
 
 
 # ---------------------------------------------------------------------------
@@ -681,7 +1146,7 @@ def upload_task_results_to_github(
         opener = urllib.request.build_opener()
 
     config_dir = args.config_name
-    domain = args.domain
+    task_type = args.task_type
     trial_dir = f"trial_{trial}"
 
     if args.dry_run:
@@ -690,7 +1155,7 @@ def upload_task_results_to_github(
             local_dir,
             args.github_results_repo,
             args.github_results_path,
-            domain,
+            task_type,
             task_id,
             config_dir,
             trial_dir,
@@ -787,12 +1252,12 @@ def upload_task_results_to_github(
 
     for file_path in files:
         rel_path = file_path.relative_to(local_path)
-        github_path = f"{args.github_results_path}/{domain}/{task_id}/{config_dir}/{trial_dir}/{rel_path}"
+        github_path = f"{args.github_results_path}/{task_type}/{task_id}/{config_dir}/{trial_dir}/{rel_path}"
         _create_blob(file_path, github_path)
 
     for artifact_path in eval_artifacts:
         github_path = (
-            f"{args.github_results_path}/{domain}/{task_id}/{config_dir}/{trial_dir}"
+            f"{args.github_results_path}/{task_type}/{task_id}/{config_dir}/{trial_dir}"
             f"/eval_artifacts/{artifact_path.name}"
         )
         _create_blob(artifact_path, github_path)
@@ -926,17 +1391,17 @@ def update_results_json_on_github(
         return
 
     config_dir = args.config_name
-    domain = args.domain
+    task_type = args.task_type
     if config_dir not in existing_data:
         existing_data[config_dir] = {}
-    if domain not in existing_data[config_dir]:
-        existing_data[config_dir][domain] = {}
-    if task_id not in existing_data[config_dir][domain]:
-        existing_data[config_dir][domain][task_id] = {}
-    if not isinstance(existing_data[config_dir][domain][task_id], dict):
-        old_score = existing_data[config_dir][domain][task_id]
-        existing_data[config_dir][domain][task_id] = {"trial_1": old_score}
-    existing_data[config_dir][domain][task_id][f"trial_{trial}"] = score
+    if task_type not in existing_data[config_dir]:
+        existing_data[config_dir][task_type] = {}
+    if task_id not in existing_data[config_dir][task_type]:
+        existing_data[config_dir][task_type][task_id] = {}
+    if not isinstance(existing_data[config_dir][task_type][task_id], dict):
+        old_score = existing_data[config_dir][task_type][task_id]
+        existing_data[config_dir][task_type][task_id] = {"trial_1": old_score}
+    existing_data[config_dir][task_type][task_id][f"trial_{trial}"] = score
 
     new_content = json.dumps(existing_data, indent=2, sort_keys=True)
     body: dict[str, Any] = {
@@ -1009,17 +1474,17 @@ def update_latency_json_on_github(
         return
 
     config_dir = args.config_name
-    domain = args.domain
+    task_type = args.task_type
     if config_dir not in existing_data:
         existing_data[config_dir] = {}
-    if domain not in existing_data[config_dir]:
-        existing_data[config_dir][domain] = {}
-    if task_id not in existing_data[config_dir][domain]:
-        existing_data[config_dir][domain][task_id] = {}
-    if not isinstance(existing_data[config_dir][domain][task_id], dict):
-        old_val = existing_data[config_dir][domain][task_id]
-        existing_data[config_dir][domain][task_id] = {"trial_1": old_val}
-    existing_data[config_dir][domain][task_id][f"trial_{trial}"] = wall_clock_seconds
+    if task_type not in existing_data[config_dir]:
+        existing_data[config_dir][task_type] = {}
+    if task_id not in existing_data[config_dir][task_type]:
+        existing_data[config_dir][task_type][task_id] = {}
+    if not isinstance(existing_data[config_dir][task_type][task_id], dict):
+        old_val = existing_data[config_dir][task_type][task_id]
+        existing_data[config_dir][task_type][task_id] = {"trial_1": old_val}
+    existing_data[config_dir][task_type][task_id][f"trial_{trial}"] = wall_clock_seconds
 
     new_content = json.dumps(existing_data, indent=2, sort_keys=True)
     body: dict[str, Any] = {
@@ -1068,7 +1533,11 @@ def main() -> None:
         task_ids = args.task_ids
         logger.info("Using %d task IDs provided via --task_ids.", len(task_ids))
     else:
-        task_ids = discover_task_ids(args.domain, args.test_config_base_dir)
+        task_ids = discover_task_ids_from_test_file(args.task_type, args.test_file)
+        if args.task_type and args.task_type != "all":
+            # Filter by task_type if needed
+            logger.warning("Domain filtering via --task_type not yet implemented for task discovery. "
+                          "Use run_baseline_task.py's --task_type flag directly or filter task_ids manually.")
 
     if not task_ids:
         logger.error("No task IDs to process. Exiting.")
@@ -1141,7 +1610,7 @@ def main() -> None:
             trial_base = os.path.join(
                 os.path.abspath(args.result_dir), f"trial_{trial_idx}"
             )
-            trial_result_dir = os.path.join(trial_base, args.domain, task_id)
+            trial_result_dir = os.path.join(trial_base, f"task_{task_id}")
             run_cmd = build_run_cmd(task_id, args)
             for i, arg in enumerate(run_cmd):
                 if arg == "--output-dir":
@@ -1173,8 +1642,16 @@ def main() -> None:
                 )
                 continue
 
-            # Generate trajectory.md before upload.
-            generate_trajectory_md(trial_result_dir, task_id)
+            # Generate trajectory.html before upload.
+            generate_trajectory_html(
+                local_dir=trial_result_dir,
+                task_id=task_id,
+                github_repo=args.github_results_repo,
+                github_path=args.github_results_path,
+                task_type=args.task_type,
+                config_name=args.config_name,
+                trial=trial_idx,
+            )
 
             # Upload results to GitHub.
             if not args.skip_github_upload:
@@ -1252,7 +1729,7 @@ def main() -> None:
         "timestamp": datetime.datetime.now().isoformat(),
         "config_name": args.config_name,
         "model": args.model,
-        "domain": args.domain,
+        "task_type": args.task_type,
         "total_tasks": len(results),
         "tasks_succeeded": sum(1 for v in results.values() if any(t["run"] for t in v["trials"])),
         "tasks_failed": sum(1 for v in results.values() if not any(t["run"] for t in v["trials"])),
@@ -1261,7 +1738,7 @@ def main() -> None:
         "average_score": round(sum(scores) / len(scores), 4) if scores else None,
         "results": results,
     }
-    summary_path = os.path.join(os.path.abspath(args.result_dir), args.domain, "batch_summary.json")
+    summary_path = os.path.join(os.path.abspath(args.result_dir), args.task_type, "batch_summary.json")
     os.makedirs(os.path.dirname(summary_path), exist_ok=True)
     with open(summary_path, "w") as fh:
         json.dump(summary, fh, indent=2)
