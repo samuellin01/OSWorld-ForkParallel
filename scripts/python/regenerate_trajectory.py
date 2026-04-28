@@ -1,12 +1,19 @@
 """Regenerate trajectory.html for existing tasks in memory_experiments_3 repo.
 
 Downloads task files from GitHub, generates trajectory.html, and uploads it back.
+Supports both parallel (fork_parallel) and baseline configs.
 
 Usage:
-    # Regenerate for a specific task/trial
+    # Regenerate for a specific task/trial (fork_parallel)
     python scripts/python/regenerate_trajectory.py \
         --task-id 01b269ae-collaborative \
         --trial 1
+
+    # Regenerate baseline trajectory
+    python scripts/python/regenerate_trajectory.py \
+        --task-id 01b269ae-collaborative \
+        --trial 1 \
+        --config baseline
 
     # Regenerate for all trials of a task
     python scripts/python/regenerate_trajectory.py \
@@ -35,6 +42,7 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _SCRIPT_DIR)
 
 from trajectory_generator import generate_trajectory_html
+from trajectory_generator_baseline import generate_trajectory_html_baseline
 
 _GITHUB_API_BASE = "https://api.github.com"
 _PROXY_URL = os.environ.get("HTTPS_PROXY", os.environ.get("HTTP_PROXY", ""))
@@ -233,15 +241,26 @@ def regenerate_single_task(
 
         # Generate trajectory.html
         print(f"\nGenerating trajectory.html...")
-        generate_trajectory_html(
-            local_dir=local_dir,
-            task_id=task_id,
-            github_repo=github_repo,
-            github_path=github_path,
-            task_type=task_type,
-            config_name=config_name,
-            trial=trial,
-        )
+        if config_name == "baseline":
+            generate_trajectory_html_baseline(
+                local_dir=local_dir,
+                task_id=task_id,
+                github_repo=github_repo,
+                github_path=github_path,
+                task_type=task_type,
+                config_name=config_name,
+                trial=trial,
+            )
+        else:
+            generate_trajectory_html(
+                local_dir=local_dir,
+                task_id=task_id,
+                github_repo=github_repo,
+                github_path=github_path,
+                task_type=task_type,
+                config_name=config_name,
+                trial=trial,
+            )
 
         # Upload trajectory.html back to GitHub
         html_path = os.path.join(local_dir, "trajectory.html")
