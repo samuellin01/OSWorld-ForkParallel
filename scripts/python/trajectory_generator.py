@@ -415,9 +415,13 @@ def generate_trajectory_html(
                 except (ValueError, OSError):
                     pass
 
-            # Get action from API call logs as fallback
-            step_info = agent_steps_map.get(agent_id, {}).get(step_num, {})
-            action = step_info.get('action', '')
+            # Screenshot shows state AFTER previous action, so get action from previous step
+            # For step 1, there's no previous action (initial state)
+            if step_num > 1:
+                prev_step_info = agent_steps_map.get(agent_id, {}).get(step_num - 1, {})
+                action = prev_step_info.get('action', '')
+            else:
+                action = "Initial state"
 
             # Read thinking/reasoning from step response file
             thinking = ""
@@ -445,9 +449,18 @@ def generate_trajectory_html(
         # Get agent timeline span
         timeline = agent_timeline.get(agent_id, {})
         start_time = timeline.get('start', 0)
-        # Use last step timestamp for end time (not API call end time)
-        # to ensure timeline bars match actual action timestamps
-        end_time = steps[-1]['timestamp'] if steps else timeline.get('end', 0)
+
+        # Use completion timestamp if available (when agent finishes)
+        # Otherwise use last step timestamp
+        completion_file = agent_dir / "completion_timestamp.txt"
+        if completion_file.is_file():
+            try:
+                completion_ts = float(completion_file.read_text().strip())
+                end_time = completion_ts - first_timestamp if first_timestamp else 0
+            except (ValueError, OSError):
+                end_time = steps[-1]['timestamp'] if steps else timeline.get('end', 0)
+        else:
+            end_time = steps[-1]['timestamp'] if steps else timeline.get('end', 0)
 
         agent_info = result_data.get("agents", {}).get(agent_id, {})
         status = agent_info.get("status", "unknown")
