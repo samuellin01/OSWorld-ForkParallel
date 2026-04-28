@@ -414,19 +414,6 @@ def generate_trajectory_html(
                 except (ValueError, OSError):
                     pass
 
-            # Screenshot N shows state AFTER action N-1, so display action from step N-1
-            # (The thinking is from step N - agent's response to seeing the current state)
-            action = ""
-            if step_num > 1:
-                prev_action_file = agent_dir / f"step_{step_num - 1:03d}_action.txt"
-                if prev_action_file.is_file():
-                    try:
-                        action = prev_action_file.read_text(encoding='utf-8', errors='replace').strip()
-                    except OSError:
-                        pass
-            else:
-                action = "Initial state"
-
             # Read thinking/reasoning from step response file
             thinking = ""
             response_file = agent_dir / f"step_{step_num:03d}_response.txt"
@@ -442,7 +429,6 @@ def generate_trajectory_html(
             steps.append({
                 'num': step_num,
                 'timestamp': timestamp,
-                'action': action,
                 'thinking': thinking,
                 'screenshot': screenshot_url,
             })
@@ -645,6 +631,34 @@ h2 {{
     align-items: center;
     margin-bottom: 16px;
 }}
+.timeline-controls {{
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}}
+.timeline-play-button {{
+    background: linear-gradient(135deg, #238636 0%, #2ea043 100%);
+    border: none;
+    color: white;
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.2em;
+    transition: all 0.2s ease;
+    box-shadow: 0 2px 8px rgba(35, 134, 54, 0.3);
+}}
+.timeline-play-button:hover {{
+    background: linear-gradient(135deg, #2ea043 0%, #238636 100%);
+    transform: scale(1.05);
+    box-shadow: 0 4px 12px rgba(35, 134, 54, 0.5);
+}}
+.timeline-play-button:active {{
+    transform: scale(0.95);
+}}
 .timeline-time {{
     font-size: 1.4em;
     background: linear-gradient(90deg, #58a6ff 0%, #79c0ff 100%);
@@ -830,27 +844,6 @@ h2 {{
     content: '\U0001F4AD ';
     opacity: 0.6;
 }}
-.display-panel-action {{
-    font-size: 0.8em;
-    color: #e6edf3;
-    margin-top: 8px;
-    padding: 10px;
-    background: #0d1117;
-    border-radius: 6px;
-    font-family: 'SF Mono', Monaco, 'Courier New', monospace;
-    word-wrap: break-word;
-    border: 1px solid #21262d;
-    line-height: 1.5;
-}}
-.display-panel-action::before {{
-    content: '\u26A1 Action: ';
-    color: #79c0ff;
-    font-weight: 600;
-    display: block;
-    margin-bottom: 6px;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-}}
-
 /* Action Log */
 .action-log {{
     background: linear-gradient(135deg, #161b22 0%, #1c2128 100%);
@@ -1049,7 +1042,10 @@ h2 {{
     h.append("<h2>⏱️ Execution Timeline</h2>")
     h.append("<div class='timeline-scrubber'>")
     h.append("  <div class='timeline-header'>")
-    h.append("    <div class='timeline-time' id='timeline-time'>0:00</div>")
+    h.append("    <div class='timeline-controls'>")
+    h.append("      <button class='timeline-play-button' id='timeline-play-button' title='Play/Pause'>▶️</button>")
+    h.append("      <div class='timeline-time' id='timeline-time'>0:00</div>")
+    h.append("    </div>")
     h.append(f"    <div style='color:#8b949e;font-size:0.85em'>Total: {fmt_duration(total_duration)}</div>")
     h.append("  </div>")
     h.append("  <div class='timeline-track-container'>")
@@ -1123,7 +1119,6 @@ h2 {{
         h.append(f"    </div>")
         h.append(f"    <img id='panel-img-{esc(agent_id)}' src='' alt='No screenshot' style='display:none'>")
         h.append(f"    <div id='panel-thinking-{esc(agent_id)}' class='display-panel-thinking' style='display:none'></div>")
-        h.append(f"    <div id='panel-action-{esc(agent_id)}' class='display-panel-action' style='display:none'></div>")
         h.append(f"  </div>")
 
     h.append("</div>")
@@ -1180,6 +1175,9 @@ h2 {{
     h.append("""
 let currentTime = 0;
 let isDragging = false;
+let isPlaying = false;
+let animationId = null;
+let lastFrameTime = null;
 
 function updateDisplays(time) {
     currentTime = time;
@@ -1201,14 +1199,12 @@ function updateDisplays(time) {
         const imgEl = document.getElementById('panel-img-' + agentId);
         const stepEl = document.getElementById('panel-step-' + agentId);
         const thinkingEl = document.getElementById('panel-thinking-' + agentId);
-        const actionEl = document.getElementById('panel-action-' + agentId);
 
         // Hide display if before agent starts or after agent finishes
         if (time < agent.start || time > agent.end) {
             imgEl.style.display = 'none';
             stepEl.textContent = 'Step —';
             thinkingEl.style.display = 'none';
-            actionEl.style.display = 'none';
             return;
         }
 
@@ -1233,18 +1229,10 @@ function updateDisplays(time) {
             } else {
                 thinkingEl.style.display = 'none';
             }
-
-            if (currentStep.action) {
-                actionEl.textContent = currentStep.action;
-                actionEl.style.display = 'block';
-            } else {
-                actionEl.style.display = 'none';
-            }
         } else {
             imgEl.style.display = 'none';
             stepEl.textContent = 'Step —';
             thinkingEl.style.display = 'none';
-            actionEl.style.display = 'none';
         }
     });
 }
@@ -1261,9 +1249,62 @@ function seekToPosition(clientX) {
     updateDisplays(time);
 }
 
+// Play/Pause functionality
+function animate(timestamp) {
+    if (!isPlaying) return;
+
+    if (lastFrameTime === null) {
+        lastFrameTime = timestamp;
+    }
+
+    const deltaTime = (timestamp - lastFrameTime) / 1000; // Convert to seconds
+    lastFrameTime = timestamp;
+
+    const newTime = currentTime + deltaTime;
+
+    if (newTime >= totalDuration) {
+        // Reached end, stop playing
+        isPlaying = false;
+        updateDisplays(totalDuration);
+        document.getElementById('timeline-play-button').textContent = '▶️';
+        lastFrameTime = null;
+    } else {
+        updateDisplays(newTime);
+        animationId = requestAnimationFrame(animate);
+    }
+}
+
+function togglePlay() {
+    isPlaying = !isPlaying;
+    const button = document.getElementById('timeline-play-button');
+
+    if (isPlaying) {
+        button.textContent = '⏸️';
+        // If at end, restart from beginning
+        if (currentTime >= totalDuration) {
+            updateDisplays(0);
+        }
+        lastFrameTime = null;
+        animationId = requestAnimationFrame(animate);
+    } else {
+        button.textContent = '▶️';
+        if (animationId) {
+            cancelAnimationFrame(animationId);
+            animationId = null;
+        }
+        lastFrameTime = null;
+    }
+}
+
+document.getElementById('timeline-play-button').addEventListener('click', togglePlay);
+
 // Click on slider
 slider.addEventListener('click', (e) => {
     if (e.target === slider || e.target === document.getElementById('timeline-progress')) {
+        // Stop playing when manually seeking
+        if (isPlaying) {
+            togglePlay();
+        }
         seekToPosition(e.clientX);
     }
 });
@@ -1271,6 +1312,10 @@ slider.addEventListener('click', (e) => {
 // Drag knob
 knob.addEventListener('mousedown', (e) => {
     isDragging = true;
+    // Stop playing when dragging
+    if (isPlaying) {
+        togglePlay();
+    }
     e.preventDefault();
 });
 
@@ -1286,7 +1331,10 @@ document.addEventListener('mouseup', () => {
 
 // Keyboard navigation
 document.addEventListener('keydown', (e) => {
-    if (e.key === 'ArrowLeft') {
+    if (e.key === ' ') {
+        e.preventDefault();
+        togglePlay();
+    } else if (e.key === 'ArrowLeft') {
         updateDisplays(Math.max(0, currentTime - 5));
     } else if (e.key === 'ArrowRight') {
         updateDisplays(Math.min(totalDuration, currentTime + 5));
