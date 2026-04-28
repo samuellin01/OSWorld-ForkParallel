@@ -414,19 +414,17 @@ def generate_trajectory_html(
                 except (ValueError, OSError):
                     pass
 
-            # Read action from step_NNN_action.txt (the action agent took in response to this screenshot)
+            # Screenshot N shows state AFTER action N-1, so display action from step N-1
             action = ""
-            action_file = agent_dir / f"step_{step_num:03d}_action.txt"
-            if action_file.is_file():
-                try:
-                    action = action_file.read_text(encoding='utf-8', errors='replace').strip()
-                except OSError:
-                    pass
-
-            # Fallback to agent_steps_map if action file doesn't exist
-            if not action:
-                step_info = agent_steps_map.get(agent_id, {}).get(step_num, {})
-                action = step_info.get('action', '')
+            if step_num > 1:
+                prev_action_file = agent_dir / f"step_{step_num - 1:03d}_action.txt"
+                if prev_action_file.is_file():
+                    try:
+                        action = prev_action_file.read_text(encoding='utf-8', errors='replace').strip()
+                    except OSError:
+                        pass
+            else:
+                action = "Initial state"
 
             # Read thinking/reasoning from step response file
             thinking = ""
