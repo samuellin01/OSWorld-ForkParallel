@@ -1,894 +1,1825 @@
-"""Single-task baseline CUA agent for OSWorld.
+"""Batch evaluation script for running the baseline AnthropicAgent
+(run_baseline_task.py) across all tasks and uploading results to GitHub.
 
-Boots a DesktopEnv, sends a task to Claude
-via AWS Bedrock with the computer-use tool, and loops until the agent outputs
-DONE/FAIL or hits --max-steps.
+Example usage:
 
-Example usage::
+    # Run all collaborative tasks (skips tasks already in results.json):
+    python scripts/python/run_batch_osworld_baseline.py
 
-    # Free-form task
-    python run_baseline_task.py \\
-        --task "Open the terminal and run 'echo hello world'" \\
-        --provider-name aws --region us-east-1 --headless
+    # Run standard tasks:
+    python scripts/python/run_batch_osworld_baseline.py --task-type standard
 
-    # Benchmark task by ID (domain auto-detected)
-    python run_baseline_task.py \\
-        --task-id bb5e4c0d-f964-439c-97b6-bdb9747de3f4 \\
-        --provider-name aws --region us-east-1 --headless
+    # Run collaborative tasks with domain filter:
+    python scripts/python/run_batch_osworld_baseline.py --domain chrome
 
-    # Benchmark task with explicit domain
-    python run_baseline_task.py \\
-        --task-id bb5e4c0d-f964-439c-97b6-bdb9747de3f4 \\
-        --domain chrome \\
-        --provider-name aws --region us-east-1 --headless
+    # Force re-run tasks that already have results:
+    python scripts/python/run_batch_osworld_baseline.py --force
+
+    # Run only specific task IDs:
+    python scripts/python/run_batch_osworld_baseline.py \
+        --task_ids 00fa164e-2612-4439-992e-157d019a8436
+
+    # Dry-run to preview commands without executing:
+    python scripts/python/run_batch_osworld_baseline.py --dry_run
+
+    # Skip GitHub upload:
+    python scripts/python/run_batch_osworld_baseline.py --skip_github_upload
 """
 
-from __future__ import annotations
-
 import argparse
+import base64
+import datetime
+import glob
 import json
 import logging
 import os
+import pathlib
+import subprocess
 import sys
 import time
-from typing import Any, Dict, List, Optional, Tuple
-
-import anthropic
-
-from google_workspace_oauth import create_sheet_from_template_oauth, create_doc_from_template_oauth, get_sheet_id_from_url
+import urllib.error
+import urllib.request
+from typing import Any
 
 # ---------------------------------------------------------------------------
-# Logger
+# Logging
 # ---------------------------------------------------------------------------
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
-# ---------------------------------------------------------------------------
-# AWS credential loader
-# ---------------------------------------------------------------------------
+datetime_str: str = datetime.datetime.now().strftime("%Y%m%d@%H%M%S")
 
-_DEFAULT_CREDENTIALS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "aws_credentials.json")
+os.makedirs("logs", exist_ok=True)
 
-
-def _load_aws_credentials(path: str) -> Tuple[str, str, str]:
-    """Load AWS credentials from *path* (JSON file).
-
-    Returns (aws_access_key_id, aws_secret_access_key, aws_session_token).
-    Falls back to empty strings and logs a warning if the file is absent
-    or malformed so that the script never crashes at startup.
-    """
-    logger = logging.getLogger(__name__)
-    _empty: Tuple[str, str, str] = ("", "", "")
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        return (
-            data.get("AWS_ACCESS_KEY_ID", ""),
-            data.get("AWS_SECRET_ACCESS_KEY", ""),
-            data.get("AWS_SESSION_TOKEN", ""),
-        )
-    except FileNotFoundError:
-        logger.warning(
-            "Credentials file not found at '%s'. Using empty credential values.",
-            path,
-        )
-    except (json.JSONDecodeError, OSError) as exc:
-        logger.warning(
-            "Could not read credentials file '%s': %s. Using empty credential values.",
-            path,
-            exc,
-        )
-    return _empty
-
-
-# ---------------------------------------------------------------------------
-# System prompt
-# ---------------------------------------------------------------------------
-
-_SYSTEM_PROMPT_TEMPLATE = (
-    "You are a computer-use agent on Ubuntu 22.04 with GNOME. "
-    "Complete the given task by interacting with the desktop. "
-    "Password: '{client_password}'. Home directory: /home/user. "
-    "If you launch Chrome from the terminal, add --remote-debugging-port=1337.\n"
-    "\n"
-    "Your goal is to complete tasks correctly and efficiently. "
-    "You are being evaluated on both task completion accuracy and efficiency (speed, resource usage).\n"
-    "\n"
-    "Google Docs/Sheets/Slides are collaborative real-time editing environments. "
-    "Multiple users can edit the same Google Workspace document simultaneously.\n"
-    "\n"
-    "Google Workspace: Do NOT use Apps Script (Extensions > Apps Script) - complete tasks through the UI directly.\n"
-    "\n"
-    "Google Sheets: Arrow keys work for navigation. If clicks aren't selecting cells reliably, "
-    "use the Name Box (top-left, shows current cell) - click it, type cell address (e.g., 'B3'), press Enter. "
-    "Batch actions together - if you can fill multiple cells in one operation, do so instead of one action per cell.\n"
-    "\n"
-    "When you complete your task, output DONE followed by a summary. "
-    "Output FAIL if the task is impossible, or [INFEASIBLE] if the task "
-    "cannot be completed due to missing features or system limitations. "
-    "You are judged on both task completion and efficiency - complete tasks quickly with minimal steps."
+_file_handler = logging.FileHandler(
+    os.path.join("logs", f"batch_run_task-{datetime_str}.log"), encoding="utf-8"
 )
+_stdout_handler = logging.StreamHandler(sys.stdout)
 
-def _build_system_prompt(client_password: str, **_kwargs) -> str:
-    return _SYSTEM_PROMPT_TEMPLATE.format(client_password=client_password)
+_file_handler.setLevel(logging.DEBUG)
+_stdout_handler.setLevel(logging.INFO)
 
+_formatter = logging.Formatter(
+    fmt="[%(asctime)s %(levelname)s %(module)s/%(lineno)d] %(message)s"
+)
+_file_handler.setFormatter(_formatter)
+_stdout_handler.setFormatter(_formatter)
 
-# ---------------------------------------------------------------------------
-# Benchmark task loader
-# ---------------------------------------------------------------------------
-
-def _find_domain_for_task_id(task_id: str, base_dir: str) -> Optional[str]:
-    """Return the domain name for *task_id* by searching test_all.json, then
-    scanning all example directories.  Returns None if not found."""
-    logger = logging.getLogger(__name__)
-
-    # 1. Try test_all.json first.
-    test_all_path = os.path.join(base_dir, "test_all.json")
-    if os.path.isfile(test_all_path):
-        try:
-            with open(test_all_path, "r", encoding="utf-8") as fh:
-                index: Dict[str, List[str]] = json.load(fh)
-            for domain, ids in index.items():
-                if task_id in ids:
-                    return domain
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning("Could not read test_all.json: %s", exc)
-
-    # 2. Fall back to scanning all domain directories.
-    examples_dir = os.path.join(base_dir, "examples")
-    if not os.path.isdir(examples_dir):
-        return None
-    for domain in os.listdir(examples_dir):
-        domain_dir = os.path.join(examples_dir, domain)
-        if not os.path.isdir(domain_dir):
-            continue
-        if os.path.isfile(os.path.join(domain_dir, f"{task_id}.json")):
-            return domain
-    return None
-
-
-def _process_google_workspace_config(task_data: Dict[str, Any]) -> Dict[str, Any]:
-    """Process google_sheet_from_template and google_doc_from_template config items.
-
-    Creates fresh Google Sheets/Docs from templates and injects URLs
-    into the task instruction and evaluator.
-
-    Returns modified task_data.
-    """
-    if "config" not in task_data:
-        return task_data
-
-    config_items = task_data["config"]
-    new_config = []
-    replacements = {}  # {placeholder: url}
-
-    # First pass: create sheets/docs and collect URLs
-    for item in config_items:
-        if item.get("type") == "google_sheet_from_template":
-            params = item["parameters"]
-            template_url = params["template_url"]
-            placeholder = params.get("placeholder", "{SHEET_URL}")
-            title = params.get("title", f"OSWorld Task {task_data.get('id', 'unknown')}")
-            client_secret_path = params.get("client_secret_path", "oauth_client_secret.json")
-            token_path = params.get("token_path", "oauth_token.pickle")
-
-            logger.info("[setup] Creating Google Sheet from template: %s", template_url)
-            sheet_url = create_sheet_from_template_oauth(
-                template_url=template_url,
-                client_secret_path=client_secret_path,
-                token_path=token_path,
-                title=title
-            )
-            logger.info("[setup] Created sheet: %s", sheet_url)
-            replacements[placeholder] = sheet_url
-
-            # Update evaluator if it references google_sheet type
-            if "evaluator" in task_data and "result" in task_data["evaluator"]:
-                result_config = task_data["evaluator"]["result"]
-                if result_config.get("type") == "google_sheet":
-                    sheet_id = get_sheet_id_from_url(sheet_url)
-                    result_config["sheet_id"] = sheet_id
-
-        elif item.get("type") == "google_doc_from_template":
-            params = item["parameters"]
-            template_url = params["template_url"]
-            placeholder = params.get("placeholder", "{DOC_URL}")
-            title = params.get("title", f"OSWorld Task Doc {task_data.get('id', 'unknown')}")
-            client_secret_path = params.get("client_secret_path", "oauth_client_secret.json")
-            token_path = params.get("token_path", "oauth_token.pickle")
-
-            logger.info("[setup] Creating Google Doc from template: %s", template_url)
-            doc_url = create_doc_from_template_oauth(
-                template_url=template_url,
-                client_secret_path=client_secret_path,
-                token_path=token_path,
-                title=title
-            )
-            logger.info("[setup] Created doc: %s", doc_url)
-            replacements[placeholder] = doc_url
-
-            # Update evaluator if it references google_doc type
-            if "evaluator" in task_data and "result" in task_data["evaluator"]:
-                result_config = task_data["evaluator"]["result"]
-                if result_config.get("type") == "google_doc":
-                    doc_id = get_sheet_id_from_url(doc_url)  # Same extraction logic
-                    result_config["doc_id"] = doc_id
-        else:
-            # Keep other config items as-is
-            new_config.append(item)
-
-    # Replace all placeholders in instruction
-    if "instruction" in task_data:
-        for placeholder, url in replacements.items():
-            task_data["instruction"] = task_data["instruction"].replace(placeholder, url)
-
-    task_data["config"] = new_config
-    return task_data
-
-
-def _load_benchmark_task(
-    task_id: str,
-    base_dir: str,
-    domain: Optional[str] = None,
-) -> Tuple[Dict[str, Any], str]:
-    """Load a benchmark task JSON and return (task_data, domain).
-
-    The full task dict is returned so callers can pass it directly to
-    ``env.reset(task_config=task_data)``, which handles snapshot revert,
-    proxy setup, evaluator configuration, and all setup step types.
-
-    Raises FileNotFoundError if the task JSON cannot be located.
-    """
-    if domain is None:
-        domain = _find_domain_for_task_id(task_id, base_dir)
-        if domain is None:
-            raise FileNotFoundError(
-                f"Task ID '{task_id}' not found in any domain under '{base_dir}'."
-            )
-
-    task_path = os.path.join(base_dir, "examples", domain, f"{task_id}.json")
-    if not os.path.isfile(task_path):
-        raise FileNotFoundError(
-            f"Task JSON not found at expected path: {task_path}"
-        )
-
-    with open(task_path, "r", encoding="utf-8") as fh:
-        data: Dict[str, Any] = json.load(fh)
-
-    return data, domain
+logger.addHandler(_file_handler)
+logger.addHandler(_stdout_handler)
 
 
 # ---------------------------------------------------------------------------
-# CLI argument parsing
+# GitHub upload constants
 # ---------------------------------------------------------------------------
 
-def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+_GITHUB_API_BASE = "https://api.github.com"
+_GITHUB_MAX_FILE_BYTES = 50 * 1024 * 1024  # 50 MB — GitHub Contents API limit
+_PROXY_URL = os.environ.get("HTTPS_PROXY", os.environ.get("HTTP_PROXY", ""))  # use env proxy if set
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run a single task in OSWorld using Claude computer-use (baseline).",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description="Batch evaluation of CUA agent on OSWorld tasks."
     )
 
-    # Task source — mutually exclusive: either a free-form string or a benchmark ID.
-    task_group = parser.add_mutually_exclusive_group(required=True)
-    task_group.add_argument(
-        "--task",
-        default=None,
-        help="Free-form task description for the agent to execute.",
+    # Task / task_type selection
+    parser.add_argument(
+        "--task-type",
+        type=str,
+        default="collaborative",
+        choices=["standard", "collaborative"],
+        help="Task type: standard or collaborative (default: collaborative)",
     )
-    task_group.add_argument(
-        "--task-id",
-        default=None,
-        metavar="UUID",
-        help=(
-            "UUID of a benchmark task under evaluation_examples/examples/. "
-            "The domain is auto-detected unless --domain is also provided."
-        ),
-    )
-
     parser.add_argument(
         "--domain",
+        type=str,
         default=None,
-        help=(
-            "Benchmark domain (e.g. chrome, gimp, os). "
-            "Only used with --task-id. If omitted the domain is auto-detected."
-        ),
+        help="Domain filter (e.g., chrome, multi_apps, all). If omitted, all tasks are run.",
     )
     parser.add_argument(
-        "--test-config-base-dir",
-        default="evaluation_examples",
-        metavar="DIR",
-        help="Base directory containing benchmark task JSONs (test_all.json + examples/).",
-    )
-    parser.add_argument(
-        "--credentials-file",
-        default=_DEFAULT_CREDENTIALS_PATH,
-        metavar="PATH",
-        help="Path to a JSON file with AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN.",
-    )
-    parser.add_argument(
-        "--model",
-        default="claude-opus-4-6",
-        help="Friendly model name (resolved to a Bedrock model ID).",
-    )
-    parser.add_argument(
-        "--max-steps",
-        type=int,
-        default=30,
-        help="Maximum number of agent steps before giving up.",
-    )
-    parser.add_argument(
-        "--temperature",
-        type=float,
-        default=0.7,
-        help="Sampling temperature for the LLM.",
-    )
-    parser.add_argument(
-        "--observation-type",
-        choices=["screenshot", "a11y_tree", "screenshot_a11y_tree"],
-        default="screenshot",
-        help="Type of observation to pass to the agent.",
-    )
-    parser.add_argument(
-        "--provider-name",
-        default="aws",
-        help="DesktopEnv provider: 'podman', 'docker', 'vmware', or 'aws'.",
-    )
-    parser.add_argument(
-        "--path-to-vm",
+        "--task_ids",
+        nargs="+",
         default=None,
-        help="Path to the VM snapshot (required for VMware provider).",
+        help="Optional list of specific task IDs to run. If omitted, all task IDs are discovered.",
+    )
+
+    # Agent / model config
+    parser.add_argument("--model", type=str, default="claude-opus-4-6")
+    parser.add_argument("--observation_type", type=str, default="screenshot")
+    parser.add_argument("--max_steps", type=int, default=300)
+    parser.add_argument("--temperature", type=float, default=0.7)
+
+    # Provider config
+    parser.add_argument("--provider_name", type=str, default="aws")
+    parser.add_argument("--region", type=str, default="us-east-1")
+    parser.add_argument("--screen_width", type=int, default=1920)
+    parser.add_argument("--screen_height", type=int, default=1080)
+
+    # GitHub upload config
+    parser.add_argument(
+        "--github_results_repo",
+        type=str,
+        default="samuellin01/memory_experiments_3",
+        help="GitHub repository to upload results to (default: samuellin01/memory_experiments_3).",
     )
     parser.add_argument(
-        "--headless",
+        "--github_results_path",
+        type=str,
+        default="osworld",
+        help="Path prefix within the GitHub repository for uploaded results (default: osworld).",
+    )
+    parser.add_argument(
+        "--config_name",
+        type=str,
+        default="baseline",
+        help="Config subfolder name for results in GitHub (default: baseline).",
+    )
+    parser.add_argument(
+        "--skip_github_upload",
         action="store_true",
-        default=False,
-        help="Run the desktop environment in headless mode.",
+        help="Skip uploading results to GitHub after each task.",
     )
     parser.add_argument(
-        "--region",
-        default="us-east-1",
-        help="AWS region (used when --provider-name is 'aws').",
-    )
-    parser.add_argument(
-        "--screen-width",
+        "--num_trials",
         type=int,
-        default=1920,
-        help="Desktop screen width in pixels.",
+        default=1,
+        help="Number of trials to run per task (default: 1).",
     )
+
+    # Timeout config
     parser.add_argument(
-        "--screen-height",
+        "--task_timeout",
         type=int,
-        default=1080,
-        help="Desktop screen height in pixels.",
+        default=7200,
+        help="Timeout in seconds for each task execution subprocess (default: 7200).",
+    )
+
+    # AWS credential refresh
+    parser.add_argument(
+        "--skip_credential_refresh",
+        action="store_true",
+        help="Skip automatic AWS credential refresh.",
     )
     parser.add_argument(
-        "--client-password",
+        "--credential_refresh_interval",
+        type=int,
+        default=0,
+        help="Re-refresh AWS credentials if at least this many seconds have elapsed "
+             "since the last refresh. 0 means refresh before every task.",
+    )
+
+    # Skip / force
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Force re-run of tasks that already have results in GitHub.",
+    )
+
+    # Misc
+    parser.add_argument(
+        "--result_dir",
+        type=str,
+        default="./batch_results",
+        help="Local results directory (default: ./batch_results).",
+    )
+    parser.add_argument(
+        "--test_file",
+        type=str,
         default=None,
-        help="Password for the desktop client. Defaults to 'osworld-public-evaluation' for AWS, 'password' otherwise.",
+        help="Specific test file to use (e.g., test_all.json, test_small.json). Default: auto-detect",
     )
     parser.add_argument(
-        "--output-dir",
-        default="task_results",
-        help="Directory to save per-step screenshots and action logs.",
+        "--test_config_base_dir",
+        type=str,
+        default="evaluation_examples",
+        help="Base directory for evaluation examples (default: evaluation_examples).",
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--credentials_file",
+        type=str,
+        default=None,
+        help="Path to AWS credentials JSON. Defaults to aws_credentials.json in repo root.",
+    )
+    parser.add_argument(
+        "--dry_run",
+        action="store_true",
+        help="Print commands that would be run without actually executing them.",
+    )
+
+    return parser.parse_args()
 
 
 # ---------------------------------------------------------------------------
-# Agent loop
+# AWS credential refresh
 # ---------------------------------------------------------------------------
 
-def run_task(
-    task: str,
-    env: Any,
-    bedrock: Any,
-    model: str,
-    temperature: float,
-    max_steps: int,
-    observation_type: str,
-    screen_width: int,
-    screen_height: int,
-    output_dir: str,
-    task_config: Optional[Dict[str, Any]] = None,
-    client_password: str = "osworld-public-evaluation",
-    aws_access_key_id: str = "",
-    aws_secret_access_key: str = "",
-    aws_session_token: str = "",
-) -> Tuple[bool, Optional[float]]:
-    """Execute *task* in *env* using the Bedrock computer-use agent (baseline, no CC).
-
-    Returns ``(success, score)`` where *success* is ``True`` if the agent
-    output DONE, and *score* is the ``env.evaluate()`` result when
-    *task_config* is provided (``None`` for free-form tasks).
-    """
-    from agent_utils import build_observation_message, COMPUTER_USE_TOOL, _resize_screenshot, filter_to_n_most_recent_images, parse_computer_use_actions
-
-    logger = logging.getLogger(__name__)
-
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Save task instruction for trajectory review.
-    with open(os.path.join(output_dir, "task.txt"), "w", encoding="utf-8") as fh:
-        fh.write(task)
-
-    tools = [COMPUTER_USE_TOOL]
-    resize_factor: Tuple[float, float] = (
-        screen_width / 1280.0,
-        screen_height / 720.0,
-    )
-
-    system_prompt = _build_system_prompt(
-        client_password=client_password,
-        aws_access_key_id=aws_access_key_id,
-        aws_secret_access_key=aws_secret_access_key,
-        aws_session_token=aws_session_token,
-    )
-
-    # Build the initial user message with the task description.
-    messages: List[Dict[str, Any]] = [
-        {
-            "role": "user",
-            "content": [{"type": "text", "text": f"Task: {task}"}],
-        }
+def refresh_aws_credentials() -> None:
+    """Refresh AWS credentials by running `cloud aws get-creds` and injecting
+    the exported variables into the current process environment."""
+    cmd = [
+        "cloud", "aws", "get-creds", "009160068926",
+        "--role", "SSOAdmin",
+        "--duration", "14400",
     ]
-
-    last_tool_use_id: Optional[str] = None
-    action_log: List[Dict[str, Any]] = []
-
-    # Reset environment and get first observation.
-    if task_config is not None:
-        env.reset(task_config=task_config)
-    else:
-        env.reset()
-
-    # Wait for the VM server to become healthy before running setup commands.
-    import requests as _req
-    _setup_url = f"http://{env.vm_ip}:{env.server_port}/setup/execute"
-    _health_ok = False
-    for _wait in range(30):  # up to ~60s
-        try:
-            _hr = _req.post(
-                _setup_url,
-                json={"command": "echo ready", "shell": True},
-                timeout=10,
-            )
-            if _hr.status_code == 200 and _hr.json().get("returncode") == 0:
-                logger.info("[SETUP] VM server is ready (waited %ds).", _wait * 2)
-                _health_ok = True
-                break
-        except Exception:
-            pass
-        time.sleep(2)
-    if not _health_ok:
-        logger.warning("[SETUP] VM server did not become healthy — setup commands may fail.")
-
-    # Pre-install tools.
-    _setup_commands = [
-        ("echo '{pw}' | sudo -S apt-get update -qq",
-         "apt-get update"),
-        ("echo '{pw}' | sudo -S apt-get install -y xdotool curl",
-         "xdotool+curl install"),
-        ("echo '{pw}' | sudo -S apt-get install -y socat 2>/dev/null; "
-         "DESKTOP_FILE=/usr/share/applications/google-chrome.desktop; "
-         "if [ -f \"$DESKTOP_FILE\" ]; then "
-         "  echo '{pw}' | sudo -S sed -i 's|^Exec=/usr/bin/google-chrome-stable|Exec=/usr/bin/google-chrome-stable --remote-debugging-port=1337|g' \"$DESKTOP_FILE\" 2>/dev/null; "
-         "  echo '{pw}' | sudo -S sed -i 's|--remote-debugging-port=1337 --remote-debugging-port=1337|--remote-debugging-port=1337|g' \"$DESKTOP_FILE\" 2>/dev/null; "
-         "fi; "
-         "pgrep -f 'socat.*9222' || nohup socat tcp-listen:9222,fork,reuseaddr tcp:localhost:1337 &>/dev/null &",
-         "Chrome debug port + socat relay"),
-    ]
-    for _cmd_template, _label in _setup_commands:
-        try:
-            _cmd = _cmd_template.replace("{pw}", client_password)
-            _resp = _req.post(
-                _setup_url,
-                json={"command": _cmd, "shell": True},
-                timeout=120,
-            )
-            if _resp.status_code == 200:
-                _data = _resp.json()
-                logger.info("[SETUP] %s: rc=%s output=%s", _label,
-                            _data.get("returncode"), _data.get("output", "")[:200])
-                if _data.get("error"):
-                    logger.warning("[SETUP] %s stderr: %s", _label, _data["error"][:200])
-        except Exception as e:
-            logger.warning("[SETUP] %s failed: %s", _label, e)
-
-    # Verify xdotool is available; retry installation if not.
-    _xdotool_ok = False
-    for _attempt in range(3):
-        try:
-            _check_resp = _req.post(
-                _setup_url,
-                json={"command": "which xdotool", "shell": True},
-                timeout=15,
-            )
-            if _check_resp.status_code == 200 and _check_resp.json().get("returncode") == 0:
-                logger.info("[SETUP] xdotool verified: %s", _check_resp.json().get("output", "").strip())
-                _xdotool_ok = True
-                break
-        except Exception:
-            pass
-        logger.warning("[SETUP] xdotool not found (attempt %d/3), retrying install …", _attempt + 1)
-        try:
-            _retry_cmd = (
-                f"echo '{client_password}' | sudo -S dpkg --configure -a 2>/dev/null; "
-                f"echo '{client_password}' | sudo -S apt-get install -y xdotool"
-            )
-            _req.post(_setup_url, json={"command": _retry_cmd, "shell": True}, timeout=120)
-        except Exception as e:
-            logger.warning("[SETUP] xdotool retry install failed: %s", e)
-        time.sleep(3)
-
-    if not _xdotool_ok:
-        logger.error("[SETUP] xdotool is NOT available after retries — typing actions will fail!")
-
-    # Debug: verify background processes launched by config steps.
-    if task_config is not None:
-        try:
-            _debug_url = f"http://{env.vm_ip}:{env.server_port}/setup/execute"
-            for _dbg_cmd, _dbg_label in [
-                ("ps aux | grep -E 'socat|chrome' | grep -v grep", "socat/chrome processes"),
-                ("ss -tlnp | grep -E '9222|1337'", "listening ports 9222/1337"),
-                ("curl -s -o /dev/null -w 'HTTP %{http_code}' http://localhost:1337/json/version/", "CDP localhost test"),
-                (f"curl -s -o /dev/null -w 'HTTP %{{http_code}}' -H 'Host: {env.vm_ip}:9222' http://localhost:1337/json/version/", "CDP external-host test"),
-            ]:
-                _dbg_resp = _req.post(
-                    _debug_url,
-                    json={"command": _dbg_cmd, "shell": True},
-                    timeout=10,
-                )
-                if _dbg_resp.status_code == 200:
-                    _dbg_data = _dbg_resp.json()
-                    logger.info("[DEBUG] %s:\n%s", _dbg_label, _dbg_data.get("output", "(empty)"))
-                    if _dbg_data.get("error"):
-                        logger.info("[DEBUG] %s stderr: %s", _dbg_label, _dbg_data["error"])
-                else:
-                    logger.warning("[DEBUG] %s check failed: HTTP %s", _dbg_label, _dbg_resp.status_code)
-        except Exception as _dbg_exc:
-            logger.warning("[DEBUG] Could not verify background processes: %s", _dbg_exc)
-
-    logger.info("Waiting 60s for the environment to settle …")
-    time.sleep(60)
-    obs = env._get_obs()
-
-    success = False
-    wall_clock_start = time.monotonic()
-    for step in range(1, max_steps + 1):
-        logger.info("=== Step %d / %d ===", step, max_steps)
-
-        # Resize screenshot for the computer-use tool (calibrated for 1280×720).
-        if obs.get("screenshot"):
-            obs = dict(obs)
-            obs["screenshot"] = _resize_screenshot(obs["screenshot"])
-
-        # Save screenshot artifact.
-        step_dir = os.path.join(output_dir, f"step_{step:04d}")
-        os.makedirs(step_dir, exist_ok=True)
-        if obs.get("screenshot"):
-            shot = obs["screenshot"]
-            if hasattr(shot, "read"):
-                shot = shot.read()
-            with open(os.path.join(step_dir, "screenshot.png"), "wb") as fh:
-                fh.write(shot)
-
-        # Build observation content blocks.
-        observation_content = build_observation_message(obs, observation_type, step)
-
-        # On subsequent steps, prepend the tool_result for the previous tool_use.
-        if last_tool_use_id is not None:
-            observation_content.insert(0, {
-                "type": "tool_result",
-                "tool_use_id": last_tool_use_id,
-                "content": "Action executed.",
-            })
-            last_tool_use_id = None
-
-        messages.append({"role": "user", "content": observation_content})
-
-        # Remove old screenshots to prevent context overflow.
-        filter_to_n_most_recent_images(messages, images_to_keep=10, min_removal_threshold=10)
-
-        # Call Bedrock.
-        try:
-            content_blocks, _ = bedrock.chat(
-                messages=messages,
-                system=system_prompt,
-                model=model,
-                temperature=temperature,
-                tools=tools,
-            )
-        except anthropic.BadRequestError as e:
-            # Detect conversation history corruption bug
-            error_msg = str(e)
-            if "tool_use" in error_msg and "tool_result" in error_msg:
-                logger.error("CONVERSATION HISTORY CORRUPTION DETECTED at step %d", step)
-                logger.error("Error: %s", error_msg)
-                # Write error file for batch script to detect
-                error_file = os.path.join(output_dir, "error.txt")
-                with open(error_file, "w", encoding="utf-8") as fh:
-                    fh.write(f"ERROR: tool_result_missing\n{error_msg}\n")
-                raise RuntimeError(f"Conversation history corruption: {error_msg}") from e
-            else:
-                # Re-raise if it's a different BadRequestError
-                raise
-
-        response_text = "".join(
-            b.get("text", "")
-            for b in content_blocks
-            if isinstance(b, dict) and b.get("type") == "text"
+    logger.info("Refreshing AWS credentials: %s", " ".join(cmd))
+    try:
+        result = subprocess.run(
+            cmd,
+            check=True,
+            capture_output=True,
+            text=True,
         )
-        logger.info("Agent response (first 300 chars): %s", response_text[:300])
+    except FileNotFoundError:
+        logger.error(
+            "AWS credential refresh failed: 'cloud' CLI not found on PATH. "
+            "Install it or pass --skip_credential_refresh if credentials are already set."
+        )
+        sys.exit(1)
+    except subprocess.CalledProcessError as e:
+        logger.error(
+            "AWS credential refresh command failed (returncode=%d).\n"
+            "stdout: %s\nstderr: %s",
+            e.returncode, e.stdout, e.stderr,
+        )
+        sys.exit(1)
 
-        # Save response artifact.
-        with open(os.path.join(step_dir, "response.txt"), "w", encoding="utf-8") as fh:
-            fh.write(response_text)
+    # Parse `export KEY=VALUE` lines and inject into os.environ.
+    refreshed: list[str] = []
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("export "):
+            continue
+        rest = line[len("export "):]
+        if "=" not in rest:
+            continue
+        key, _, value = rest.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if key:
+            os.environ[key] = value
+            refreshed.append(key)
 
-        messages.append({"role": "assistant", "content": content_blocks})
+    if not refreshed:
+        logger.warning(
+            "AWS credential refresh command succeeded but no 'export KEY=VALUE' lines "
+            "were found in its output. Credentials may not have been updated."
+        )
+    else:
+        logger.info(
+            "AWS credentials refreshed successfully. Updated variables: %s",
+            ", ".join(refreshed),
+        )
 
-        # Parse computer-use actions.
-        actions = parse_computer_use_actions(content_blocks, resize_factor)
+    # Write credentials to aws_credentials.json so run_task.py can read them.
+    creds_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "aws_credentials.json")
+    creds_path = os.path.normpath(creds_path)
+    try:
+        creds = {
+            "AWS_ACCESS_KEY_ID": os.environ.get("AWS_ACCESS_KEY_ID", ""),
+            "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY", ""),
+            "AWS_SESSION_TOKEN": os.environ.get("AWS_SESSION_TOKEN", ""),
+        }
+        with open(creds_path, "w", encoding="utf-8") as fh:
+            json.dump(creds, fh, indent=2)
+        os.chmod(creds_path, 0o600)
+        logger.info("AWS credentials written to %s", creds_path)
+    except OSError as exc:
+        logger.error("Failed to write credentials file %s: %s", creds_path, exc)
 
-        # Track tool_use_id for the next tool_result message.
-        for block in content_blocks:
-            if isinstance(block, dict) and block.get("type") == "tool_use":
-                last_tool_use_id = block.get("id")
-                break
 
-        # Determine executable action code (first non-terminal action).
-        action_code: Optional[str] = None
-        for act in actions:
-            if act not in ("DONE", "FAIL", "WAIT", "CALL_USER"):
-                action_code = act
-                break
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-        # Save action artifact.
-        if action_code:
-            with open(os.path.join(step_dir, "action.py"), "w", encoding="utf-8") as fh:
-                fh.write(action_code)
+def fetch_existing_results(args: argparse.Namespace) -> dict[str, dict]:
+    """Fetch existing results.json from GitHub for the current config_name.
 
-        action_log.append({
-            "step": step,
-            "actions": actions,
-            "action_code": action_code,
-            "response_text": response_text[:500],
+    Format: {config: {task_type: {task_id: {trial_N: score}}}}
+    """
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        return {}
+
+    if _PROXY_URL:
+        proxy_handler = urllib.request.ProxyHandler(
+            {"http": _PROXY_URL, "https": _PROXY_URL}
+        )
+        opener = urllib.request.build_opener(proxy_handler)
+    else:
+        opener = urllib.request.build_opener()
+
+    api_base = f"{_GITHUB_API_BASE}/repos/{args.github_results_repo}/contents"
+    github_path = f"{args.github_results_path}/results.json"
+    url = f"{api_base}/{github_path}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with opener.open(req) as resp:
+            resp_data = json.loads(resp.read().decode("utf-8"))
+            content_b64 = resp_data.get("content", "")
+            data = json.loads(base64.b64decode(content_b64).decode("utf-8"))
+            config_data = data.get(args.config_name, {})
+            # Format: {config: {task_type: {task_id: {trial_N: score}}}}
+            task_type_data = config_data.get(args.task_type, {})
+            return task_type_data
+    except Exception as exc:
+        logger.warning("Could not fetch existing results.json: %s", exc)
+        return {}
+
+
+def get_existing_trial_numbers(
+    task_id: str, args: argparse.Namespace
+) -> list[int]:
+    """Get list of existing trial numbers for a task/config on GitHub.
+
+    Returns a list of trial numbers (e.g., [1, 3, 5] if trial_1, trial_3, trial_5 exist).
+    """
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        return []
+
+    if _PROXY_URL:
+        proxy_handler = urllib.request.ProxyHandler(
+            {"http": _PROXY_URL, "https": _PROXY_URL}
+        )
+        opener = urllib.request.build_opener(proxy_handler)
+    else:
+        opener = urllib.request.build_opener()
+
+    api_base = f"{_GITHUB_API_BASE}/repos/{args.github_results_repo}/contents"
+    github_path = (
+        f"{args.github_results_path}/{args.task_type}/{task_id}/{args.config_name}"
+    )
+    url = f"{api_base}/{github_path}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with opener.open(req) as resp:
+            items = json.loads(resp.read().decode("utf-8"))
+            trial_numbers = []
+            for item in items:
+                if item.get("type") == "dir" and item.get("name", "").startswith("trial_"):
+                    try:
+                        trial_num = int(item.get("name", "").replace("trial_", ""))
+                        trial_numbers.append(trial_num)
+                    except ValueError:
+                        pass
+            return sorted(trial_numbers)
+    except Exception:
+        return []
+
+
+def find_next_trial_slots(existing_trials: list[int], num_new_trials: int) -> list[int]:
+    """Find the next available trial slots, filling gaps first.
+
+    Args:
+        existing_trials: List of existing trial numbers (e.g., [1, 3, 5])
+        num_new_trials: Number of new trial slots needed
+
+    Returns:
+        List of trial numbers to use (e.g., [2, 4] if 2 new trials needed)
+
+    Examples:
+        >>> find_next_trial_slots([1, 3], 2)
+        [2, 4]
+        >>> find_next_trial_slots([2], 1)
+        [1]
+        >>> find_next_trial_slots([], 3)
+        [1, 2, 3]
+    """
+    if not existing_trials:
+        return list(range(1, num_new_trials + 1))
+
+    slots = []
+    candidate = 1
+    existing_set = set(existing_trials)
+
+    while len(slots) < num_new_trials:
+        if candidate not in existing_set:
+            slots.append(candidate)
+        candidate += 1
+
+    return slots
+
+
+def discover_task_ids_from_test_file(task_type: str, test_file: str | None) -> list[str]:
+    """Discover all task IDs from test JSON files."""
+    # Import from run_benchmark.py
+    repo_root = pathlib.Path(__file__).parent.parent.parent
+    sys.path.insert(0, str(repo_root))
+    from run_benchmark import load_osworld_tasks
+
+    tasks = load_osworld_tasks(task_type=task_type, test_file=test_file)
+    task_ids = [t.get("id") for t in tasks if t.get("id")]
+    logger.info("Discovered %d task IDs for task_type '%s'.", len(task_ids), task_type)
+    return task_ids
+
+
+def local_result_dir(task_id: str, args: argparse.Namespace, trial: int = 1) -> str:
+    """Return the expected local result directory for a task trial."""
+    return os.path.join(
+        os.path.abspath(args.result_dir), f"trial_{trial}", f"task_{task_id}"
+    )
+
+
+_REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+
+
+def build_run_cmd(task_id: str, args: argparse.Namespace) -> list:
+    """Build the subprocess command to run a single task."""
+    run_task_path = os.path.join(_REPO_ROOT, "run_baseline_task.py")
+    result_dir = os.path.abspath(args.result_dir)
+    config_base_dir = os.path.abspath(args.test_config_base_dir)
+    cmd = [
+        sys.executable,
+        run_task_path,
+        "--task-id", task_id,
+        "--headless",
+        "--observation-type", args.observation_type,
+        "--max-steps", str(args.max_steps),
+        "--model", args.model,
+        "--temperature", str(args.temperature),
+        "--provider-name", args.provider_name,
+        "--region", args.region,
+        "--screen-width", str(args.screen_width),
+        "--screen-height", str(args.screen_height),
+        "--output-dir", result_dir,
+        "--test-config-base-dir", config_base_dir,
+    ]
+    if args.domain:
+        cmd += ["--domain", args.domain]
+    if args.credentials_file:
+        cmd += ["--credentials-file", args.credentials_file]
+    return cmd
+
+
+def run_subprocess(cmd: list, timeout: int, dry_run: bool, description: str) -> bool:
+    """Run a subprocess command. Returns True on success, False on failure."""
+    logger.info("[CMD] %s: %s", description, " ".join(cmd))
+    if dry_run:
+        logger.info("[DRY RUN] Would execute: %s", " ".join(cmd))
+        return True
+    try:
+        result = subprocess.run(
+            cmd,
+            timeout=timeout,
+            check=False,
+            capture_output=False,
+        )
+        # run_task.py exits 0 on DONE, 1 on FAIL/INCOMPLETE — both are valid completions
+        if result.returncode in (0, 1):
+            logger.info("[COMPLETED] %s (returncode=%d)", description, result.returncode)
+            return True
+        logger.error("[FAILED] %s — returncode=%d", description, result.returncode)
+        return False
+    except subprocess.TimeoutExpired:
+        logger.error("[TIMEOUT] %s — exceeded %ds", description, timeout)
+        return False
+    except Exception as e:  # noqa: BLE001
+        logger.error("[ERROR] %s — %s: %s", description, type(e).__name__, e)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Trajectory HTML generator
+# ---------------------------------------------------------------------------
+
+def generate_trajectory_html(
+    local_dir: str,
+    task_id: str,
+    github_repo: str,
+    github_path: str,
+    task_type: str,
+    config_name: str,
+    trial: int = 1,
+) -> None:
+    """Generate interactive trajectory.html for baseline (single-agent) execution."""
+    local_path = pathlib.Path(local_dir)
+    if not local_path.is_dir():
+        return
+
+    # Read task instruction
+    task_txt = local_path / "task.txt"
+    instruction = ""
+    if task_txt.is_file():
+        instruction = task_txt.read_text(encoding="utf-8", errors="replace").strip()
+
+    # Read action log
+    action_log_path = local_path / "action_log.json"
+    action_log: list[dict] = []
+    if action_log_path.is_file():
+        try:
+            action_log = json.loads(action_log_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # Read result score
+    result_path = local_path / "result.txt"
+    score = None
+    if result_path.is_file():
+        try:
+            score = float(result_path.read_text(encoding="utf-8").strip())
+        except (ValueError, OSError):
+            pass
+
+    # Read token usage
+    token_usage_path = local_path / "token_usage.json"
+    token_usage: dict = {}
+    if token_usage_path.is_file():
+        try:
+            token_usage = json.loads(token_usage_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    wall_clock = token_usage.get("wall_clock_seconds") or token_usage.get("total_latency_seconds") or 0
+    cost = token_usage.get("total_cost_usd") or 0
+
+    # Find step directories
+    step_dirs = sorted(
+        (d for d in local_path.iterdir() if d.is_dir() and d.name.startswith("step_")),
+        key=lambda d: d.name,
+    )
+
+    # Format duration helper
+    def fmt_duration(secs: float) -> str:
+        if secs < 60:
+            return f"{secs:.0f}s"
+        m, s = divmod(int(secs), 60)
+        return f"{m}m {s}s"
+
+    # Build step data
+    steps = []
+    for step_dir in step_dirs:
+        step_name = step_dir.name
+        step_num = int(step_name.replace("step_", "").lstrip("0") or "0")
+
+        # Read thinking/response
+        thinking = ""
+        response_file = step_dir / "response.txt"
+        if response_file.is_file():
+            thinking = response_file.read_text(encoding="utf-8", errors="replace").strip()
+
+        # Screenshot
+        screenshot_file = step_dir / "screenshot.png"
+        screenshot_url = f"{step_name}/screenshot.png" if screenshot_file.is_file() else ""
+
+        # Action from action log
+        action = ""
+        if step_num - 1 < len(action_log):
+            entry = action_log[step_num - 1]
+            actions = entry.get("actions", [])
+            if actions:
+                action = ", ".join(str(a) for a in actions)
+
+        steps.append({
+            'num': step_num,
+            'thinking': thinking,
+            'screenshot': screenshot_url,
+            'action': action,
         })
 
-        # Handle terminal tokens.
-        if "DONE" in actions:
-            logger.info("Agent output DONE — task complete.")
-            env.step("DONE")
-            _save_action_log(output_dir, action_log)
-            success = True
-            break
+    # Generate HTML
+    img_base = f"https://raw.githubusercontent.com/{github_repo}/main/{github_path}/{task_type}/{task_id}/{config_name}/trial_{trial}"
 
-        if "FAIL" in actions:
-            logger.info("Agent output FAIL — task cannot be completed.")
-            env.step("FAIL")
-            _save_action_log(output_dir, action_log)
-            break
+    h = []
+    h.append("<!DOCTYPE html>")
+    h.append("<html lang='en'>")
+    h.append("<head>")
+    h.append("  <meta charset='UTF-8'>")
+    h.append("  <meta name='viewport' content='width=device-width, initial-scale=1.0'>")
+    h.append(f"  <title>Baseline Trajectory: {task_id}</title>")
+    h.append("  <style>")
+    h.append("""
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #0d1117;
+    color: #e6edf3;
+    line-height: 1.6;
+    padding: 20px;
+}
+.container {
+    max-width: 1400px;
+    margin: 0 auto;
+}
+h1 {
+    font-size: 2em;
+    margin-bottom: 20px;
+    color: #58a6ff;
+}
+.summary {
+    background: linear-gradient(135deg, #161b22 0%, #1c2128 100%);
+    border: 1px solid #30363d;
+    border-radius: 12px;
+    padding: 20px;
+    margin-bottom: 30px;
+}
+.summary-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 15px;
+    margin-top: 15px;
+}
+.summary-item {
+    background: #0d1117;
+    padding: 12px;
+    border-radius: 8px;
+    border: 1px solid #21262d;
+}
+.summary-label {
+    font-size: 0.85em;
+    color: #8b949e;
+    margin-bottom: 5px;
+}
+.summary-value {
+    font-size: 1.3em;
+    font-weight: 600;
+    color: #e6edf3;
+}
+.instruction {
+    background: #161b22;
+    padding: 15px;
+    border-radius: 8px;
+    border-left: 4px solid #58a6ff;
+    margin-top: 15px;
+    font-size: 0.95em;
+}
+.timeline-scrubber {
+    background: linear-gradient(135deg, #161b22 0%, #1c2128 100%);
+    border: 1px solid #30363d;
+    border-radius: 12px;
+    padding: 20px;
+    margin-bottom: 30px;
+}
+.timeline-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 16px;
+}
+.timeline-controls {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+.timeline-play-button {
+    background: linear-gradient(135deg, #238636 0%, #2ea043 100%);
+    border: none;
+    color: white;
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.2em;
+    transition: all 0.2s ease;
+    box-shadow: 0 2px 8px rgba(35, 134, 54, 0.3);
+}
+.timeline-play-button:hover {
+    background: linear-gradient(135deg, #2ea043 0%, #238636 100%);
+    transform: scale(1.05);
+}
+.timeline-speed-selector {
+    background: #161b22;
+    border: 1px solid #30363d;
+    color: #e6edf3;
+    padding: 6px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 0.9em;
+    font-weight: 600;
+    transition: all 0.2s ease;
+}
+.timeline-speed-selector:hover {
+    background: #21262d;
+    border-color: #58a6ff;
+}
+.timeline-time {
+    font-size: 1.4em;
+    background: linear-gradient(90deg, #58a6ff 0%, #79c0ff 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+}
+.timeline-slider {
+    width: 100%;
+    height: 20px;
+    background: #0d1117;
+    border-radius: 10px;
+    position: relative;
+    cursor: pointer;
+    border: 1px solid #21262d;
+}
+.timeline-progress {
+    position: absolute;
+    height: 100%;
+    background: linear-gradient(90deg, #238636 0%, #2ea043 100%);
+    border-radius: 10px;
+    transition: width 0.1s ease-out;
+}
+.timeline-knob {
+    position: absolute;
+    width: 16px;
+    height: 16px;
+    background: #ffffff;
+    border-radius: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    cursor: grab;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.5);
+    transition: left 0.1s ease-out;
+}
+.timeline-knob:active {
+    cursor: grabbing;
+    transform: translate(-50%, -50%) scale(1.2);
+}
+.display-panel {
+    background: linear-gradient(135deg, #161b22 0%, #1c2128 100%);
+    border: 1px solid #30363d;
+    border-radius: 12px;
+    padding: 20px;
+    margin-bottom: 30px;
+}
+.display-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 15px;
+}
+.display-step {
+    font-size: 0.9em;
+    color: #8b949e;
+}
+.display-content {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+    align-items: start;
+}
+.display-screenshot {
+    width: 100%;
+}
+.display-screenshot img {
+    width: 100%;
+    border-radius: 8px;
+    border: 1px solid #30363d;
+}
+.display-thinking-container {
+    min-height: 100px;
+}
+.display-panel-thinking {
+    font-size: 0.85em;
+    color: #c9d1d9;
+    background: linear-gradient(135deg, #1c2128 0%, #22272e 100%);
+    padding: 12px;
+    border-radius: 8px;
+    border-left: 3px solid #58a6ff;
+    white-space: pre-wrap;
+    line-height: 1.6;
+    font-style: italic;
+}
+.display-panel-thinking::before {
+    content: '💭 ';
+    opacity: 0.6;
+}
+.action-log {
+    background: linear-gradient(135deg, #161b22 0%, #1c2128 100%);
+    border: 1px solid #30363d;
+    border-radius: 12px;
+    padding: 16px;
+}
+.action-log h2 {
+    margin-bottom: 15px;
+    font-size: 1.3em;
+}
+.action-item {
+    background: #0d1117;
+    border: 1px solid #21262d;
+    border-radius: 6px;
+    padding: 10px 12px;
+    margin-bottom: 8px;
+    display: grid;
+    grid-template-columns: 80px 1fr;
+    gap: 12px;
+    font-size: 0.9em;
+}
+.action-step {
+    color: #8b949e;
+    font-weight: 600;
+}
+.action-detail {
+    color: #c9d1d9;
+    word-wrap: break-word;
+    line-height: 1.6;
+}
+""")
+    h.append("  </style>")
+    h.append("</head>")
+    h.append("<body>")
+    h.append("  <div class='container'>")
+    h.append(f"    <h1>Baseline Trajectory: {task_id}</h1>")
 
-        if action_code:
-            logger.info("Executing action: %s", action_code[:200])
-            try:
-                obs, _reward, done, _info = env.step(action_code)
-            except (RuntimeError, OSError, ValueError) as exc:
-                logger.warning("env.step() raised: %s", exc)
-                error_content: List[Dict[str, Any]] = []
-                if last_tool_use_id is not None:
-                    error_content.append({
-                        "type": "tool_result",
-                        "tool_use_id": last_tool_use_id,
-                        "content": f"Action error: {exc}",
-                        "is_error": True,
-                    })
-                    last_tool_use_id = None
-                else:
-                    error_content.append({
-                        "type": "text",
-                        "text": f"Action error: {exc}",
-                    })
-                messages.append({"role": "user", "content": error_content})
-                continue
-            if done:
-                logger.info("Environment signalled done.")
-                _save_action_log(output_dir, action_log)
-                success = True
-                break
-        elif "WAIT" in actions:
-            logger.info("Agent WAIT.")
-            time.sleep(2)
-        else:
-            logger.warning("No action or token found — skipping step.")
+    # Summary
+    h.append("    <div class='summary'>")
+    h.append("      <div class='summary-grid'>")
+    h.append("        <div class='summary-item'>")
+    h.append("          <div class='summary-label'>Score</div>")
+    h.append(f"          <div class='summary-value'>{score if score is not None else 'N/A'}</div>")
+    h.append("        </div>")
+    h.append("        <div class='summary-item'>")
+    h.append("          <div class='summary-label'>Duration</div>")
+    h.append(f"          <div class='summary-value'>{fmt_duration(wall_clock)}</div>")
+    h.append("        </div>")
+    h.append("        <div class='summary-item'>")
+    h.append("          <div class='summary-label'>Steps</div>")
+    h.append(f"          <div class='summary-value'>{len(steps)}</div>")
+    h.append("        </div>")
+    h.append("        <div class='summary-item'>")
+    h.append("          <div class='summary-label'>Cost</div>")
+    h.append(f"          <div class='summary-value'>${cost:.2f}</div>")
+    h.append("        </div>")
+    h.append("      </div>")
+    if instruction:
+        h.append(f"      <div class='instruction'>{instruction}</div>")
+    h.append("    </div>")
 
-    else:
-        logger.warning("Reached max steps (%d) without DONE/FAIL.", max_steps)
-        _save_action_log(output_dir, action_log)
+    # Timeline scrubber
+    h.append("    <div class='timeline-scrubber'>")
+    h.append("      <h2>⏱️ Execution Timeline</h2>")
+    h.append("      <div class='timeline-header'>")
+    h.append("        <div class='timeline-controls'>")
+    h.append("          <button class='timeline-play-button' id='timeline-play-button' title='Play/Pause'>▶️</button>")
+    h.append("          <select class='timeline-speed-selector' id='timeline-speed-selector'>")
+    h.append("            <option value='1'>1x</option>")
+    h.append("            <option value='2'>2x</option>")
+    h.append("            <option value='4' selected>4x</option>")
+    h.append("            <option value='8'>8x</option>")
+    h.append("            <option value='16'>16x</option>")
+    h.append("          </select>")
+    h.append("          <div class='timeline-time' id='timeline-time'>Step 0</div>")
+    h.append("        </div>")
+    h.append(f"        <div style='color:#8b949e;font-size:0.85em'>Total: {len(steps)} steps</div>")
+    h.append("      </div>")
+    h.append("      <div class='timeline-slider' id='timeline-slider'>")
+    h.append("        <div class='timeline-progress' id='timeline-progress' style='width: 0%'></div>")
+    h.append("        <div class='timeline-knob' id='timeline-knob' style='left: 0%'></div>")
+    h.append("      </div>")
+    h.append("    </div>")
 
-    # Evaluate the benchmark result if a task config was provided.
-    score: Optional[float] = None
-    if task_config is not None:
-        logger.info("Waiting 20s before evaluation …")
-        time.sleep(20)
-        score = env.evaluate()
-        logger.info("Benchmark score: %.4f", score)
-        with open(os.path.join(output_dir, "result.txt"), "w", encoding="utf-8") as fh:
-            fh.write(f"{score}\n")
-        # Write evaluation diagnostics
-        if hasattr(env, 'last_eval_details') and env.last_eval_details:
-            with open(os.path.join(output_dir, "eval_details.json"), "w", encoding="utf-8") as fh:
-                json.dump(env.last_eval_details, fh, indent=2, default=str, ensure_ascii=False)
+    # Display panel
+    h.append("    <div class='display-panel'>")
+    h.append("      <div class='display-header'>")
+    h.append("        <h2>📺 Display</h2>")
+    h.append("        <div class='display-step' id='display-step'>Step —</div>")
+    h.append("      </div>")
+    h.append("      <div class='display-content'>")
+    h.append("        <div class='display-screenshot'>")
+    h.append("          <img id='display-img' src='' alt='No screenshot' style='display:none'>")
+    h.append("        </div>")
+    h.append("        <div class='display-thinking-container'>")
+    h.append("          <div id='display-thinking' class='display-panel-thinking' style='display:none'></div>")
+    h.append("        </div>")
+    h.append("      </div>")
+    h.append("    </div>")
 
-    # Log and save token usage summary.
-    wall_clock_seconds = round(time.monotonic() - wall_clock_start, 3)
-    logger.info("Wall-clock time: %.1fs", wall_clock_seconds)
-    if hasattr(bedrock, "get_token_usage"):
-        token_usage = bedrock.get_token_usage()
-        token_usage["wall_clock_seconds"] = wall_clock_seconds
-        logger.info(
-            "Token usage | steps=%d total_input=%d output=%d uncached=%d "
-            "cache_write=%d cache_read=%d cost=$%.4f latency=%.1fs wall=%.1fs",
-            token_usage["step_count"],
-            token_usage["total_input_tokens"],
-            token_usage["total_output_tokens"],
-            token_usage["total_uncached_input_tokens"],
-            token_usage["total_cache_write_tokens"],
-            token_usage["total_cache_read_tokens"],
-            token_usage["total_cost_usd"],
-            token_usage["total_latency_seconds"],
-            wall_clock_seconds,
-        )
-        with open(os.path.join(output_dir, "token_usage.json"), "w") as fh:
-            json.dump(token_usage, fh, indent=2)
+    # Action log
+    h.append("    <div class='action-log'>")
+    h.append("      <h2>📋 Action Log</h2>")
+    for i, step in enumerate(steps):
+        h.append("      <div class='action-item'>")
+        h.append(f"        <div class='action-step'>Step {step['num']}</div>")
+        h.append(f"        <div class='action-detail'>{step['action'] if step['action'] else '—'}</div>")
+        h.append("      </div>")
+    h.append("    </div>")
 
-    return success, score
+    h.append("  </div>")
 
+    # JavaScript
+    h.append("  <script>")
+    h.append(f"const steps = {json.dumps(steps)};")
+    h.append(f"const imgBase = '{img_base}';")
+    h.append("""
+let currentStepIndex = 0;
+let currentPlaybackPosition = 0;  // For smooth playback
+let isPlaying = false;
+let animationId = null;
+let lastFrameTime = null;
+let playbackSpeed = 4;
 
-def _save_action_log(output_dir: str, action_log: List[Dict[str, Any]]) -> None:
-    log_path = os.path.join(output_dir, "action_log.json")
-    with open(log_path, "w", encoding="utf-8") as fh:
-        json.dump(action_log, fh, indent=2)
-    logging.getLogger(__name__).info("Action log saved to %s", log_path)
+function updateDisplay(stepIndex) {
+    if (steps.length === 0) return;
 
+    currentStepIndex = Math.max(0, Math.min(Math.floor(stepIndex), steps.length - 1));
+    const step = steps[currentStepIndex];
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+    document.getElementById('timeline-time').textContent = 'Step ' + step.num;
 
-def main(argv: list[str] | None = None) -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        stream=sys.stdout,
-    )
-    logger = logging.getLogger(__name__)
+    const progress = steps.length > 1 ? (currentStepIndex / (steps.length - 1)) * 100 : 0;
+    document.getElementById('timeline-progress').style.width = progress + '%';
+    document.getElementById('timeline-knob').style.left = progress + '%';
 
-    args = _parse_args(argv)
+    const imgEl = document.getElementById('display-img');
+    const stepEl = document.getElementById('display-step');
+    const thinkingEl = document.getElementById('display-thinking');
 
-    # Load AWS credentials fresh at launch.
-    aws_access_key_id, aws_secret_access_key, aws_session_token = _load_aws_credentials(
-        args.credentials_file
-    )
+    stepEl.textContent = 'Step ' + step.num;
 
-    # Resolve task instruction and output directory.
-    task_data: Optional[Dict[str, Any]] = None
-    if args.task_id is not None:
-        # Benchmark task mode.
-        try:
-            task_data, domain = _load_benchmark_task(
-                task_id=args.task_id,
-                base_dir=args.test_config_base_dir,
-                domain=args.domain,
-            )
-        except FileNotFoundError as exc:
-            logger.error("%s", exc)
-            sys.exit(1)
-
-        # Process Google Workspace templates if present
-        task_data = _process_google_workspace_config(task_data)
-
-        task_instruction: str = task_data.get("instruction", "")
-        logger.info("Benchmark task ID: %s (domain: %s)", args.task_id, domain)
-        logger.info("Instruction: %s", task_instruction)
-        output_dir = os.path.join(args.output_dir, f"task_{args.task_id}")
-    else:
-        # Free-form task mode.
-        task_instruction = args.task
-        output_dir = args.output_dir
-        domain = None
-
-    # Resolve client_password default based on provider.
-    client_password = args.client_password
-    if client_password is None:
-        client_password = "osworld-public-evaluation" if args.provider_name == "aws" else "password"
-
-    # Import DesktopEnv lazily so the module can be imported without it installed.
-    try:
-        from desktop_env.desktop_env import DesktopEnv
-    except ImportError as exc:
-        logger.error(
-            "Could not import DesktopEnv: %s\n"
-            "Make sure you have installed the desktop_env package from this repo.",
-            exc,
-        )
-        sys.exit(1)
-
-    try:
-        from bedrock_client import BedrockClient
-    except ImportError as exc:
-        logger.error("Could not import BedrockClient: %s", exc)
-        sys.exit(1)
-
-    screen_size = (args.screen_width, args.screen_height)
-    env_kwargs: dict = {
-        "provider_name": args.provider_name,
-        "action_space": "pyautogui",
-        "screen_size": screen_size,
-        "headless": args.headless,
-        "os_type": "Ubuntu",
-        "require_a11y_tree": args.observation_type in ("a11y_tree", "screenshot_a11y_tree"),
-        "enable_proxy": True,
-        "client_password": client_password,
+    if (step.screenshot) {
+        imgEl.src = imgBase + '/' + step.screenshot;
+        imgEl.style.display = 'block';
+    } else {
+        imgEl.style.display = 'none';
     }
-    if args.path_to_vm:
-        env_kwargs["path_to_vm"] = args.path_to_vm
-    if args.provider_name == "aws":
-        from desktop_env.providers.aws.manager import IMAGE_ID_MAP
-        if args.region not in IMAGE_ID_MAP:
-            raise ValueError(
-                f"AWS region '{args.region}' is not in IMAGE_ID_MAP. "
-                f"Available regions: {list(IMAGE_ID_MAP.keys())}"
-            )
-        region_map = IMAGE_ID_MAP[args.region]
-        ami_id = region_map.get(screen_size, region_map.get((1920, 1080)))
-        if ami_id is None:
-            raise ValueError(
-                f"No AMI found for screen size {screen_size} or default (1920, 1080) "
-                f"in region '{args.region}'."
-            )
-        env_kwargs["region"] = args.region
-        env_kwargs["snapshot_name"] = ami_id
 
-    logger.info("Task: %s", task_instruction)
-    logger.info("Creating DesktopEnv with provider '%s' …", args.provider_name)
-    env = DesktopEnv(**env_kwargs)
+    if (step.thinking) {
+        thinkingEl.textContent = step.thinking;
+        thinkingEl.style.display = 'block';
+    } else {
+        thinkingEl.style.display = 'none';
+    }
+}
 
-    bedrock = BedrockClient(region=args.region, log_dir=output_dir)
+function animate(timestamp) {
+    if (!isPlaying) return;
+
+    if (lastFrameTime === null) {
+        lastFrameTime = timestamp;
+    }
+
+    const deltaTime = (timestamp - lastFrameTime) / 1000;
+    lastFrameTime = timestamp;
+
+    const stepsPerSecond = playbackSpeed;
+    currentPlaybackPosition += deltaTime * stepsPerSecond;
+
+    if (currentPlaybackPosition >= steps.length - 1) {
+        isPlaying = false;
+        currentPlaybackPosition = steps.length - 1;
+        updateDisplay(currentPlaybackPosition);
+        document.getElementById('timeline-play-button').textContent = '▶️';
+        lastFrameTime = null;
+    } else {
+        updateDisplay(currentPlaybackPosition);
+        animationId = requestAnimationFrame(animate);
+    }
+}
+
+function togglePlay() {
+    isPlaying = !isPlaying;
+    const button = document.getElementById('timeline-play-button');
+
+    if (isPlaying) {
+        button.textContent = '⏸️';
+        if (currentStepIndex >= steps.length - 1) {
+            currentPlaybackPosition = 0;
+            updateDisplay(0);
+        } else {
+            currentPlaybackPosition = currentStepIndex;
+        }
+        lastFrameTime = null;
+        animationId = requestAnimationFrame(animate);
+    } else {
+        button.textContent = '▶️';
+        if (animationId) {
+            cancelAnimationFrame(animationId);
+            animationId = null;
+        }
+        lastFrameTime = null;
+    }
+}
+
+document.getElementById('timeline-play-button').addEventListener('click', togglePlay);
+
+document.getElementById('timeline-speed-selector').addEventListener('change', (e) => {
+    playbackSpeed = parseFloat(e.target.value);
+});
+
+const slider = document.getElementById('timeline-slider');
+const knob = document.getElementById('timeline-knob');
+
+function seekToPosition(clientX) {
+    const rect = slider.getBoundingClientRect();
+    const x = Math.max(0, Math.min(clientX - rect.left, rect.width));
+    const percent = x / rect.width;
+    const stepIndex = percent * (steps.length - 1);
+    currentPlaybackPosition = stepIndex;
+    updateDisplay(stepIndex);
+}
+
+slider.addEventListener('click', (e) => {
+    if (e.target === slider || e.target === document.getElementById('timeline-progress')) {
+        if (isPlaying) togglePlay();
+        seekToPosition(e.clientX);
+    }
+});
+
+let isDragging = false;
+knob.addEventListener('mousedown', (e) => {
+    isDragging = true;
+    if (isPlaying) togglePlay();
+    e.preventDefault();
+});
+
+document.addEventListener('mousemove', (e) => {
+    if (isDragging) {
+        seekToPosition(e.clientX);
+    }
+});
+
+document.addEventListener('mouseup', () => {
+    isDragging = false;
+});
+
+document.addEventListener('keydown', (e) => {
+    if (e.key === ' ') {
+        e.preventDefault();
+        togglePlay();
+    } else if (e.key === 'ArrowLeft') {
+        currentPlaybackPosition = Math.max(0, currentStepIndex - 1);
+        updateDisplay(currentPlaybackPosition);
+    } else if (e.key === 'ArrowRight') {
+        currentPlaybackPosition = Math.min(steps.length - 1, currentStepIndex + 1);
+        updateDisplay(currentPlaybackPosition);
+    } else if (e.key === 'Home') {
+        currentPlaybackPosition = 0;
+        updateDisplay(0);
+    } else if (e.key === 'End') {
+        currentPlaybackPosition = steps.length - 1;
+        updateDisplay(steps.length - 1);
+    }
+});
+
+// Initialize
+updateDisplay(0);
+""")
+    h.append("  </script>")
+    h.append("</body>")
+    h.append("</html>")
+
+    html_path = local_path / "trajectory.html"
+    html_path.write_text("\n".join(h), encoding="utf-8")
+    logger.info("Generated %s (%d steps)", html_path, len(steps))
+
+
+# ---------------------------------------------------------------------------
+# GitHub upload
+# ---------------------------------------------------------------------------
+
+def _collect_eval_artifact_files(local_dir: str, task_id: str) -> list[pathlib.Path]:
+    """Find eval artifact files (actual/expected values) referenced in eval_details.json.
+
+    The evaluator stores fetched files under ``cache/{task_id}/``.  This function
+    reads eval_details.json, extracts any ``actual_value`` or ``expected_value``
+    that looks like a file path, and returns the ones that exist on disk.
+    """
+    eval_details_path = os.path.join(local_dir, "eval_details.json")
+    if not os.path.isfile(eval_details_path):
+        return []
 
     try:
-        success, score = run_task(
-            task=task_instruction,
-            env=env,
-            bedrock=bedrock,
-            model=args.model,
-            temperature=args.temperature,
-            max_steps=args.max_steps,
-            observation_type=args.observation_type,
-            screen_width=args.screen_width,
-            screen_height=args.screen_height,
-            output_dir=output_dir,
-            task_config=task_data,
-            client_password=client_password,
-            aws_access_key_id=aws_access_key_id,
-            aws_secret_access_key=aws_secret_access_key,
-            aws_session_token=aws_session_token,
-        )
-    finally:
-        logger.info("Closing environment …")
-        env.close()
+        with open(eval_details_path, "r", encoding="utf-8") as fh:
+            details = json.load(fh)
+    except (json.JSONDecodeError, OSError):
+        return []
 
-    status = "DONE" if success else "FAIL/INCOMPLETE"
-    print(f"\nTask result: {status}")
-    if score is not None:
-        print(f"Benchmark score: {score:.4f}")
-    if hasattr(bedrock, "get_token_usage"):
-        tu = bedrock.get_token_usage()
-        print(
-            f"Token usage: steps={tu['step_count']} total_input={tu['total_input_tokens']} "
-            f"output={tu['total_output_tokens']} cost=${tu['total_cost_usd']:.4f} "
-            f"latency={tu['total_latency_seconds']:.1f}s"
+    artifact_files: list[pathlib.Path] = []
+    for metric in details.get("metric_details", []):
+        for key in ("actual_value", "expected_value"):
+            val = metric.get(key)
+            if not isinstance(val, str):
+                continue
+            # Skip values that are clearly not file paths (too long, contain braces, etc.)
+            if len(val) > 500 or "{" in val:
+                continue
+            # Values like "cache/00fa164e-.../file.docx" are relative paths
+            p = pathlib.Path(val)
+            try:
+                if p.is_file():
+                    artifact_files.append(p)
+            except OSError:
+                continue
+    return artifact_files
+
+
+def _github_api_request(
+    opener: urllib.request.OpenerDirector,
+    url: str,
+    headers: dict,
+    method: str = "GET",
+    body: bytes | None = None,
+) -> dict:
+    """Make a GitHub API request and return the parsed JSON response."""
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    with opener.open(req) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def upload_task_results_to_github(
+    local_dir: str,
+    task_id: str,
+    args: argparse.Namespace,
+    trial: int = 1,
+) -> None:
+    """Upload a single task's result directory to GitHub.
+
+    Files under ``local_dir`` are uploaded to
+    ``{github_results_path}/{task_id}/{config_name}/`` in the target repo.
+    Also uploads eval artifact files (actual/expected values from eval_details.json)
+    found under the ``cache/`` directory.
+
+    All files are batched into a single commit using the Git Trees API to avoid
+    409 Conflict errors that occur when many files are uploaded via the Contents API.
+
+    Requires the ``GITHUB_TOKEN`` environment variable to be set with a fine-grained
+    PAT that has Contents read/write permission on the target repository.
+    """
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        logger.warning(
+            "GITHUB_TOKEN is not set; skipping GitHub upload. "
+            "Set GITHUB_TOKEN with Contents read/write permission on %s.",
+            args.github_results_repo,
         )
-    print(f"Artifacts saved to: {output_dir}")
-    sys.exit(0 if success else 1)
+        return
+
+    if not args.dry_run and not os.path.isdir(local_dir):
+        logger.warning(
+            "[UPLOAD SKIP] Local result directory not found (task may have crashed "
+            "before writing output): %s",
+            local_dir,
+        )
+        return
+
+    if _PROXY_URL:
+        proxy_handler = urllib.request.ProxyHandler(
+            {"http": _PROXY_URL, "https": _PROXY_URL}
+        )
+        opener = urllib.request.build_opener(proxy_handler)
+    else:
+        opener = urllib.request.build_opener()
+
+    config_dir = args.config_name
+    task_type = args.task_type
+    trial_dir = f"trial_{trial}"
+
+    if args.dry_run:
+        logger.info(
+            "[dry-run] Would upload %s → %s/%s/%s/%s/%s/%s/",
+            local_dir,
+            args.github_results_repo,
+            args.github_results_path,
+            task_type,
+            task_id,
+            config_dir,
+            trial_dir,
+        )
+        return
+
+    # Collect result directory files.
+    local_path = pathlib.Path(local_dir)
+    files = sorted(p for p in local_path.rglob("*") if p.is_file())
+
+    # Collect eval artifact files (actual/expected values from eval_details.json).
+    eval_artifacts = _collect_eval_artifact_files(local_dir, task_id)
+    if eval_artifacts:
+        logger.info(
+            "Found %d eval artifact file(s) to upload: %s",
+            len(eval_artifacts),
+            [str(p) for p in eval_artifacts],
+        )
+
+    total_files = len(files) + len(eval_artifacts)
+    if total_files == 0:
+        logger.warning("No files to upload for task %s", task_id)
+        return
+
+    logger.info(
+        "Uploading %d result file(s) + %d eval artifact(s) for task %s via Git Trees API",
+        len(files),
+        len(eval_artifacts),
+        task_id,
+    )
+
+    api_base = f"{_GITHUB_API_BASE}/repos/{args.github_results_repo}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "Content-Type": "application/json",
+    }
+    branch = "main"
+
+    # Step 1: GET the current commit SHA of the default branch.
+    try:
+        ref_data = _github_api_request(
+            opener, f"{api_base}/git/ref/heads/{branch}", headers,
+        )
+        head_commit_sha = ref_data["object"]["sha"]
+    except Exception as exc:
+        logger.error("Failed to get HEAD ref for branch '%s': %s", branch, exc)
+        return
+
+    # Step 2: GET the tree SHA from that commit.
+    try:
+        commit_data = _github_api_request(
+            opener, f"{api_base}/git/commits/{head_commit_sha}", headers,
+        )
+        base_tree_sha = commit_data["tree"]["sha"]
+    except Exception as exc:
+        logger.error("Failed to get commit %s: %s", head_commit_sha, exc)
+        return
+
+    # Step 3: Create blobs for each file.
+    tree_items: list[dict] = []
+
+    def _create_blob(file_path: pathlib.Path, github_path: str) -> bool:
+        file_size = file_path.stat().st_size
+        if file_size > _GITHUB_MAX_FILE_BYTES:
+            logger.warning(
+                "Skipping %s — file too large (%d bytes > 50 MB limit)",
+                github_path, file_size,
+            )
+            return False
+        content_b64 = base64.b64encode(file_path.read_bytes()).decode("ascii")
+        blob_body = json.dumps({
+            "content": content_b64,
+            "encoding": "base64",
+        }).encode("utf-8")
+        try:
+            blob_data = _github_api_request(
+                opener, f"{api_base}/git/blobs", headers,
+                method="POST", body=blob_body,
+            )
+            tree_items.append({
+                "path": github_path,
+                "mode": "100644",
+                "type": "blob",
+                "sha": blob_data["sha"],
+            })
+            return True
+        except urllib.error.HTTPError as exc:
+            logger.error("Failed to create blob for %s: HTTP %d %s", github_path, exc.code, exc.reason)
+            return False
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Failed to create blob for %s: %s", github_path, exc)
+            return False
+
+    for file_path in files:
+        rel_path = file_path.relative_to(local_path)
+        github_path = f"{args.github_results_path}/{task_type}/{task_id}/{config_dir}/{trial_dir}/{rel_path}"
+        _create_blob(file_path, github_path)
+
+    for artifact_path in eval_artifacts:
+        github_path = (
+            f"{args.github_results_path}/{task_type}/{task_id}/{config_dir}/{trial_dir}"
+            f"/eval_artifacts/{artifact_path.name}"
+        )
+        _create_blob(artifact_path, github_path)
+
+    if not tree_items:
+        logger.warning("No blobs were created for task %s; skipping commit.", task_id)
+        return
+
+    # Step 4: Create a new tree with all blobs.
+    try:
+        tree_body = json.dumps({
+            "base_tree": base_tree_sha,
+            "tree": tree_items,
+        }).encode("utf-8")
+        tree_data = _github_api_request(
+            opener, f"{api_base}/git/trees", headers,
+            method="POST", body=tree_body,
+        )
+        new_tree_sha = tree_data["sha"]
+        logger.info("Created tree with %d file(s) (SHA: %s)", len(tree_items), new_tree_sha[:12])
+    except Exception as exc:
+        logger.error("Failed to create tree for task %s: %s", task_id, exc)
+        return
+
+    # Steps 5-6: Create commit and update ref, with retry on race condition.
+    commit_message = f"Add OSWorld eval results: {task_id}/{config_dir}/{trial_dir}"
+    max_ref_retries = 5
+    for attempt in range(max_ref_retries):
+        # Re-fetch HEAD on retries (another terminal may have pushed).
+        if attempt > 0:
+            try:
+                ref_data = _github_api_request(
+                    opener, f"{api_base}/git/ref/heads/{branch}", headers,
+                )
+                head_commit_sha = ref_data["object"]["sha"]
+                logger.info("Retry %d: re-fetched HEAD (SHA: %s)", attempt, head_commit_sha[:12])
+            except Exception as exc:
+                logger.error("Retry %d: failed to re-fetch HEAD: %s", attempt, exc)
+                return
+
+        # Create commit with current HEAD as parent.
+        try:
+            commit_body = json.dumps({
+                "message": commit_message,
+                "tree": new_tree_sha,
+                "parents": [head_commit_sha],
+            }).encode("utf-8")
+            new_commit_data = _github_api_request(
+                opener, f"{api_base}/git/commits", headers,
+                method="POST", body=commit_body,
+            )
+            new_commit_sha = new_commit_data["sha"]
+            logger.info("Created commit (SHA: %s): %s", new_commit_sha[:12], commit_message)
+        except Exception as exc:
+            logger.error("Failed to create commit for task %s: %s", task_id, exc)
+            return
+
+        # Update ref — may fail with 422 if another terminal pushed in between.
+        try:
+            ref_body = json.dumps({"sha": new_commit_sha}).encode("utf-8")
+            _github_api_request(
+                opener, f"{api_base}/git/refs/heads/{branch}", headers,
+                method="PATCH", body=ref_body,
+            )
+            logger.info(
+                "Committed %d file(s) for task %s to refs/heads/%s",
+                len(tree_items), task_id, branch,
+            )
+            break  # Success
+        except urllib.error.HTTPError as exc:
+            if exc.code == 422 and attempt < max_ref_retries - 1:
+                wait = 1.0 * (attempt + 1)
+                logger.warning(
+                    "Ref update race (attempt %d/%d), retrying in %.0fs …",
+                    attempt + 1, max_ref_retries, wait,
+                )
+                time.sleep(wait)
+            else:
+                logger.error("Failed to update ref heads/%s: HTTP %d %s", branch, exc.code, exc.reason)
+                return
+        except Exception as exc:
+            logger.error("Failed to update ref heads/%s: %s", branch, exc)
+            return
+
+
+def update_results_json_on_github(
+    task_id: str,
+    score: float | None,
+    args: argparse.Namespace,
+    trial: int = 1,
+) -> None:
+    """Update the central results.json on GitHub with this task's score."""
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        return
+
+    if _PROXY_URL:
+        proxy_handler = urllib.request.ProxyHandler(
+            {"http": _PROXY_URL, "https": _PROXY_URL}
+        )
+        opener = urllib.request.build_opener(proxy_handler)
+    else:
+        opener = urllib.request.build_opener()
+
+    api_base = f"{_GITHUB_API_BASE}/repos/{args.github_results_repo}/contents"
+    github_path = f"{args.github_results_path}/results.json"
+    url = f"{api_base}/{github_path}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "Content-Type": "application/json",
+    }
+
+    existing_data: dict = {}
+    file_sha: str | None = None
+    get_req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with opener.open(get_req) as resp:
+            resp_data = json.loads(resp.read().decode("utf-8"))
+            file_sha = resp_data.get("sha")
+            content_b64 = resp_data.get("content", "")
+            existing_data = json.loads(base64.b64decode(content_b64).decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            logger.info("results.json does not exist yet, will create it.")
+        else:
+            logger.error("Failed to fetch results.json: HTTP %d", exc.code)
+            return
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Failed to fetch results.json: %s", exc)
+        return
+
+    config_dir = args.config_name
+    task_type = args.task_type
+    if config_dir not in existing_data:
+        existing_data[config_dir] = {}
+    if task_type not in existing_data[config_dir]:
+        existing_data[config_dir][task_type] = {}
+    if task_id not in existing_data[config_dir][task_type]:
+        existing_data[config_dir][task_type][task_id] = {}
+    if not isinstance(existing_data[config_dir][task_type][task_id], dict):
+        old_score = existing_data[config_dir][task_type][task_id]
+        existing_data[config_dir][task_type][task_id] = {"trial_1": old_score}
+    existing_data[config_dir][task_type][task_id][f"trial_{trial}"] = score
+
+    new_content = json.dumps(existing_data, indent=2, sort_keys=True)
+    body: dict[str, Any] = {
+        "message": f"Update results.json: {task_id}/{config_dir} = {score}",
+        "content": base64.b64encode(new_content.encode("utf-8")).decode("ascii"),
+    }
+    if file_sha:
+        body["sha"] = file_sha
+
+    put_req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers=headers,
+        method="PUT",
+    )
+    try:
+        with opener.open(put_req) as resp:
+            logger.info("Updated results.json (HTTP %d): %s/%s = %s", resp.status, config_dir, task_id, score)
+    except urllib.error.HTTPError as exc:
+        logger.error("Failed to update results.json: HTTP %d %s", exc.code, exc.reason)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Failed to update results.json: %s", exc)
+
+
+def update_latency_json_on_github(
+    task_id: str,
+    wall_clock_seconds: float | None,
+    args: argparse.Namespace,
+    trial: int = 1,
+) -> None:
+    """Update latency_results.json on GitHub with this task's wall-clock time."""
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        return
+
+    if _PROXY_URL:
+        proxy_handler = urllib.request.ProxyHandler(
+            {"http": _PROXY_URL, "https": _PROXY_URL}
+        )
+        opener = urllib.request.build_opener(proxy_handler)
+    else:
+        opener = urllib.request.build_opener()
+
+    api_base = f"{_GITHUB_API_BASE}/repos/{args.github_results_repo}/contents"
+    github_path = f"{args.github_results_path}/latency_results.json"
+    url = f"{api_base}/{github_path}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "Content-Type": "application/json",
+    }
+
+    existing_data: dict = {}
+    file_sha: str | None = None
+    get_req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with opener.open(get_req) as resp:
+            resp_data = json.loads(resp.read().decode("utf-8"))
+            file_sha = resp_data.get("sha")
+            content_b64 = resp_data.get("content", "")
+            existing_data = json.loads(base64.b64decode(content_b64).decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            logger.info("latency_results.json does not exist yet, will create it.")
+        else:
+            logger.error("Failed to fetch latency_results.json: HTTP %d", exc.code)
+            return
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Failed to fetch latency_results.json: %s", exc)
+        return
+
+    config_dir = args.config_name
+    task_type = args.task_type
+    if config_dir not in existing_data:
+        existing_data[config_dir] = {}
+    if task_type not in existing_data[config_dir]:
+        existing_data[config_dir][task_type] = {}
+    if task_id not in existing_data[config_dir][task_type]:
+        existing_data[config_dir][task_type][task_id] = {}
+    if not isinstance(existing_data[config_dir][task_type][task_id], dict):
+        old_val = existing_data[config_dir][task_type][task_id]
+        existing_data[config_dir][task_type][task_id] = {"trial_1": old_val}
+    existing_data[config_dir][task_type][task_id][f"trial_{trial}"] = wall_clock_seconds
+
+    new_content = json.dumps(existing_data, indent=2, sort_keys=True)
+    body: dict[str, Any] = {
+        "message": f"Update latency_results.json: {task_id}/{config_dir} = {wall_clock_seconds}s",
+        "content": base64.b64encode(new_content.encode("utf-8")).decode("ascii"),
+    }
+    if file_sha:
+        body["sha"] = file_sha
+
+    put_req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers=headers,
+        method="PUT",
+    )
+    try:
+        with opener.open(put_req) as resp:
+            logger.info("Updated latency_results.json (HTTP %d): %s/%s = %ss", resp.status, config_dir, task_id, wall_clock_seconds)
+    except urllib.error.HTTPError as exc:
+        logger.error("Failed to update latency_results.json: HTTP %d %s", exc.code, exc.reason)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Failed to update latency_results.json: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    args = parse_args()
+
+    # ------------------------------------------------------------------
+    # AWS credential refresh (at startup, unless skipped)
+    # ------------------------------------------------------------------
+    last_credential_refresh: float = 0.0
+    if args.skip_credential_refresh:
+        logger.info(
+            "--skip_credential_refresh set; skipping automatic AWS credential refresh."
+        )
+    else:
+        refresh_aws_credentials()
+        last_credential_refresh = time.monotonic()
+
+    # Discover or use provided task IDs.
+    if args.task_ids:
+        task_ids = args.task_ids
+        logger.info("Using %d task IDs provided via --task_ids.", len(task_ids))
+    else:
+        task_ids = discover_task_ids_from_test_file(args.task_type, args.test_file)
+        if args.task_type and args.task_type != "all":
+            # Filter by task_type if needed
+            logger.warning("Domain filtering via --task_type not yet implemented for task discovery. "
+                          "Use run_baseline_task.py's --task_type flag directly or filter task_ids manually.")
+
+    if not task_ids:
+        logger.error("No task IDs to process. Exiting.")
+        sys.exit(1)
+
+    # Fetch existing results to skip already-completed tasks.
+    existing_results: dict[str, float | None] = {}
+    if not args.force and not args.skip_github_upload:
+        existing_results = fetch_existing_results(args)
+        if existing_results:
+            logger.info(
+                "Found %d existing results in GitHub. Use --force to re-run them.",
+                len(existing_results),
+            )
+
+    logger.info(
+        "Starting batch evaluation: %d tasks.",
+        len(task_ids),
+    )
+    if args.dry_run:
+        logger.info("[DRY RUN] No commands will actually be executed.")
+
+    # Track results: {task_id: {"run": bool, "score": float | None}}
+    results: dict[str, dict] = {}
+    skipped: list[str] = []
+
+    for task_idx, task_id in enumerate(task_ids, start=1):
+        logger.info(
+            "=== Task %d/%d: %s ===", task_idx, len(task_ids), task_id
+        )
+
+        # Skip if already has a result (score is not None).
+        if task_id in existing_results and existing_results[task_id] is not None:
+            logger.info(
+                "SKIP %s — already has result (score=%s). Use --force to re-run.",
+                task_id, existing_results[task_id],
+            )
+            skipped.append(task_id)
+            continue
+
+        results[task_id] = {"trials": []}
+
+        # Determine which trial slots to use, filling gaps in existing trials.
+        existing_trials = []
+        if not args.skip_github_upload:
+            existing_trials = get_existing_trial_numbers(task_id, args)
+
+        trial_slots = find_next_trial_slots(existing_trials, args.num_trials)
+        logger.info(
+            "Task %s: existing trials=%s, will run trials=%s",
+            task_id, existing_trials, trial_slots,
+        )
+
+        for trial_num, trial_idx in enumerate(trial_slots, start=1):
+            logger.info(
+                "--- Trial %d/%d (trial_%d) for task %s ---",
+                trial_num, args.num_trials, trial_idx, task_id,
+            )
+
+            # Refresh credentials if interval elapsed.
+            if not args.skip_credential_refresh:
+                if (
+                    args.credential_refresh_interval <= 0
+                    or (time.monotonic() - last_credential_refresh) >= args.credential_refresh_interval
+                ):
+                    refresh_aws_credentials()
+                    last_credential_refresh = time.monotonic()
+
+            # Build and run the single-task command.
+            trial_base = os.path.join(
+                os.path.abspath(args.result_dir), f"trial_{trial_idx}"
+            )
+            trial_result_dir = os.path.join(trial_base, f"task_{task_id}")
+            run_cmd = build_run_cmd(task_id, args)
+            for i, arg in enumerate(run_cmd):
+                if arg == "--output-dir":
+                    run_cmd[i + 1] = trial_base
+                    break
+            run_ok = run_subprocess(
+                run_cmd,
+                timeout=args.task_timeout,
+                dry_run=args.dry_run,
+                description=f"run task {task_id} trial {trial_idx}",
+            )
+
+            trial_score = None
+            trial_error = None
+
+            # Check for error.txt first
+            error_txt = os.path.join(trial_result_dir, "error.txt")
+            if os.path.isfile(error_txt):
+                try:
+                    with open(error_txt) as fh:
+                        error_content = fh.read()
+                        if "tool_result_missing" in error_content:
+                            trial_error = "tool_result_missing"
+                            logger.error(
+                                "Task %s trial %d: Conversation history corruption detected",
+                                task_id, trial_idx
+                            )
+                        else:
+                            trial_error = "unknown_error"
+                            logger.error(
+                                "Task %s trial %d: Error detected: %s",
+                                task_id, trial_idx, error_content[:200]
+                            )
+                except OSError:
+                    pass
+
+            # Only read score if no error
+            if trial_error is None:
+                result_txt = os.path.join(trial_result_dir, "result.txt")
+                if os.path.isfile(result_txt):
+                    try:
+                        with open(result_txt) as fh:
+                            trial_score = float(fh.read().strip())
+                    except (ValueError, OSError):
+                        pass
+
+            results[task_id]["trials"].append({
+                "trial": trial_idx, "run": run_ok, "score": trial_score, "error": trial_error,
+            })
+
+            if not run_ok:
+                logger.warning(
+                    "Task %s trial %d FAILED — skipping upload.", task_id, trial_idx
+                )
+                continue
+
+            # Generate trajectory.html before upload.
+            generate_trajectory_html(
+                local_dir=trial_result_dir,
+                task_id=task_id,
+                github_repo=args.github_results_repo,
+                github_path=args.github_results_path,
+                task_type=args.task_type,
+                config_name=args.config_name,
+                trial=trial_idx,
+            )
+
+            # Upload results to GitHub.
+            if not args.skip_github_upload:
+                upload_task_results_to_github(
+                    local_dir=trial_result_dir,
+                    task_id=task_id,
+                    args=args,
+                    trial=trial_idx,
+                )
+                update_results_json_on_github(
+                    task_id=task_id,
+                    score=trial_score,
+                    args=args,
+                    trial=trial_idx,
+                )
+                task_wall_clock = None
+                tu_path = os.path.join(trial_result_dir, "token_usage.json")
+                if os.path.isfile(tu_path):
+                    try:
+                        with open(tu_path) as fh:
+                            task_wall_clock = json.loads(fh.read()).get("wall_clock_seconds")
+                    except (json.JSONDecodeError, OSError):
+                        pass
+                update_latency_json_on_github(
+                    task_id=task_id,
+                    wall_clock_seconds=task_wall_clock,
+                    args=args,
+                    trial=trial_idx,
+                )
+
+            if trial_error:
+                logger.warning("Task %s trial %d ERROR: %s", task_id, trial_idx, trial_error)
+            else:
+                score_str = f" score={trial_score}" if trial_score is not None else ""
+                logger.info("Task %s trial %d COMPLETED.%s", task_id, trial_idx, score_str)
+
+    # ---------------------------------------------------------------------------
+    # Summary
+    # ---------------------------------------------------------------------------
+    logger.info("=" * 60)
+    logger.info("BATCH EVALUATION SUMMARY")
+    logger.info("=" * 60)
+
+    all_trials = []
+    for v in results.values():
+        all_trials.extend(v.get("trials", []))
+    run_success = [t for t in all_trials if t["run"]]
+    run_failed = [t for t in all_trials if not t["run"]]
+    error_trials = [t for t in all_trials if t.get("error")]
+    scores = [t["score"] for t in all_trials if t["score"] is not None]
+
+    if skipped:
+        logger.info("Tasks skipped: %d (already have results)", len(skipped))
+    logger.info(
+        "Trials run:   %d succeeded, %d failed (out of %d total across %d tasks)",
+        len(run_success),
+        len(run_failed),
+        len(all_trials),
+        len(results),
+    )
+
+    if error_trials:
+        logger.warning("Trials with errors: %d", len(error_trials))
+        for t in error_trials:
+            logger.warning("  - trial_%d: %s", t["trial"], t.get("error"))
+
+    if scores:
+        avg_score = sum(scores) / len(scores)
+        pass_count = sum(1 for s in scores if s > 0)
+        logger.info(
+            "Scores:       %d evaluated, %d passed, avg=%.4f",
+            len(scores),
+            pass_count,
+            avg_score,
+        )
+
+    if run_failed:
+        logger.info("FAILED RUNS:")
+        for t in run_failed:
+            logger.info("  - trial_%d", t["trial"])
+
+    # Write batch summary JSON.
+    summary = {
+        "timestamp": datetime.datetime.now().isoformat(),
+        "config_name": args.config_name,
+        "model": args.model,
+        "task_type": args.task_type,
+        "total_tasks": len(results),
+        "tasks_succeeded": sum(1 for v in results.values() if any(t["run"] for t in v["trials"])),
+        "tasks_failed": sum(1 for v in results.values() if not any(t["run"] for t in v["trials"])),
+        "tasks_evaluated": len(scores),
+        "tasks_passed": sum(1 for s in scores if s > 0) if scores else 0,
+        "average_score": round(sum(scores) / len(scores), 4) if scores else None,
+        "results": results,
+    }
+    summary_path = os.path.join(os.path.abspath(args.result_dir), args.task_type, "batch_summary.json")
+    os.makedirs(os.path.dirname(summary_path), exist_ok=True)
+    with open(summary_path, "w") as fh:
+        json.dump(summary, fh, indent=2)
+    logger.info("Batch summary saved to %s", summary_path)
+
+    if not run_failed:
+        logger.info("All tasks completed successfully.")
+
+    logger.info("=" * 60)
+
+    # Exit with non-zero code if any task failed.
+    if run_failed:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
