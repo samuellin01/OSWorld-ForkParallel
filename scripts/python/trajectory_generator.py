@@ -765,6 +765,18 @@ h2 {{
     background: linear-gradient(90deg, #f85149 0%, #da3633 100%);
     box-shadow: 0 2px 8px rgba(248, 81, 73, 0.3);
 }}
+.timeline-bar.agent-child-4 {{
+    background: linear-gradient(90deg, #56d364 0%, #3fb950 100%);
+    box-shadow: 0 2px 8px rgba(86, 211, 100, 0.3);
+}}
+.timeline-bar.agent-child-5 {{
+    background: linear-gradient(90deg, #ff7b72 0%, #f85149 100%);
+    box-shadow: 0 2px 8px rgba(255, 123, 114, 0.3);
+}}
+.timeline-bar.agent-child-6 {{
+    background: linear-gradient(90deg, #ffa657 0%, #f0883e 100%);
+    box-shadow: 0 2px 8px rgba(255, 166, 87, 0.3);
+}}
 .timeline-bar.agent-child {{
     background: linear-gradient(90deg, #8b949e 0%, #6e7681 100%);
     box-shadow: 0 2px 8px rgba(139, 148, 158, 0.3);
