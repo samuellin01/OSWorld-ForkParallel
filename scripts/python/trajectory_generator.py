@@ -441,6 +441,11 @@ def generate_trajectory_html(
             'steps': steps,
         })
 
+    # Recalculate total duration from actual agent end times
+    # This ensures timeline duration matches the last actual step, not API call processing time
+    if agent_data:
+        total_duration = max(agent['end'] for agent in agent_data)
+
     # -- Build action log ---------------------------------------------------
 
     def classify_action_type(action_text: str, tool_name: str) -> str:
