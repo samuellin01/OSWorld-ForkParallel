@@ -585,9 +585,6 @@ def run_task(
 
         messages.append({"role": "user", "content": observation_content})
 
-        # Remove old screenshots to prevent context overflow.
-        filter_to_n_most_recent_images(messages, images_to_keep=10, min_removal_threshold=10)
-
         # Call Bedrock.
         try:
             content_blocks, _ = bedrock.chat(
