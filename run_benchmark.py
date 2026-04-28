@@ -36,6 +36,61 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def aggregate_token_usage(bedrock_clients: Dict[str, BedrockClient]) -> Dict[str, Any]:
+    """Aggregate token usage from all bedrock clients."""
+    total_step_count = 0
+    total_input_tokens = 0
+    total_output_tokens = 0
+    total_uncached_input_tokens = 0
+    total_cache_write_tokens = 0
+    total_cache_read_tokens = 0
+    total_cost_usd = 0.0
+    total_input_cost_usd = 0.0
+    total_output_cost_usd = 0.0
+    total_latency_seconds = 0.0
+    all_llm_calls = []
+
+    for agent_id, client in bedrock_clients.items():
+        usage = client.get_token_usage()
+        total_step_count += usage["step_count"]
+        total_input_tokens += usage["total_input_tokens"]
+        total_output_tokens += usage["total_output_tokens"]
+        total_uncached_input_tokens += usage["total_uncached_input_tokens"]
+        total_cache_write_tokens += usage["total_cache_write_tokens"]
+        total_cache_read_tokens += usage["total_cache_read_tokens"]
+        total_cost_usd += usage["total_cost_usd"]
+        total_input_cost_usd += usage["total_input_cost_usd"]
+        total_output_cost_usd += usage["total_output_cost_usd"]
+        total_latency_seconds += usage["total_latency_seconds"]
+
+        # Add agent_id to each call for tracking
+        for call in usage["llm_calls"]:
+            call_with_agent = call.copy()
+            call_with_agent["agent_id"] = agent_id
+            all_llm_calls.append(call_with_agent)
+
+    avg_latency = (
+        total_latency_seconds / total_step_count if total_step_count > 0 else 0.0
+    )
+
+    return {
+        "step_count": total_step_count,
+        "total_input_tokens": total_input_tokens,
+        "total_output_tokens": total_output_tokens,
+        "total_tokens": total_input_tokens + total_output_tokens,
+        "total_uncached_input_tokens": total_uncached_input_tokens,
+        "total_cache_write_tokens": total_cache_write_tokens,
+        "total_cache_read_tokens": total_cache_read_tokens,
+        "total_cost_usd": round(total_cost_usd, 6),
+        "total_input_cost_usd": round(total_input_cost_usd, 6),
+        "total_output_cost_usd": round(total_output_cost_usd, 6),
+        "total_latency_seconds": round(total_latency_seconds, 3),
+        "average_latency_per_step_seconds": round(avg_latency, 3),
+        "llm_calls": all_llm_calls,
+        "num_llm_calls": total_step_count,
+    }
+
+
 def _process_google_workspace_config(task_data: Dict[str, Any]) -> Dict[str, Any]:
     """Process google_sheet_from_template and google_doc_from_template config items.
 
@@ -318,6 +373,7 @@ def agent_monitor_thread(
     max_steps: int,
     output_dir: str,
     region: str,
+    bedrock_clients: Dict[str, BedrockClient],
 ):
     """Monitor for new agents and spawn threads to run them."""
     running_threads = {}
@@ -352,6 +408,7 @@ def agent_monitor_thread(
                 log_dir=agent_output,
                 agent_id=agent_id
             )
+            bedrock_clients[agent_id] = agent_bedrock  # Track for token aggregation
 
             thread = threading.Thread(
                 target=run_agent_thread,
@@ -575,8 +632,9 @@ def run_single_task(task_data, args, output_base):
     runtime = AgentRuntime(vm_exec=vm_exec, num_displays=8, password="osworld-public-evaluation")
     runtime.initialize()
 
-    # Initialize Bedrock
-    bedrock = BedrockClient(region=args.region, log_dir=output_dir)
+    # Initialize Bedrock - shared dict to track all agent clients
+    bedrock = BedrockClient(region=args.region, log_dir=output_dir, agent_id="root")
+    bedrock_clients = {"root": bedrock}  # Track all bedrock clients for token aggregation
 
     # Setup already ran via env.reset(task_config=task_data) above
     # No need to execute config again
@@ -587,7 +645,7 @@ def run_single_task(task_data, args, output_base):
     # Start monitor
     monitor = threading.Thread(
         target=agent_monitor_thread,
-        args=(runtime, vm_ip, port, bedrock, args.model, args.max_steps, output_dir, args.region),
+        args=(runtime, vm_ip, port, bedrock, args.model, args.max_steps, output_dir, args.region, bedrock_clients),
         daemon=True,
     )
     monitor.start()
@@ -614,6 +672,9 @@ def run_single_task(task_data, args, output_base):
     all_agents = runtime.get_all_agents()
     root_info = runtime.get_agent_status(root_id)
 
+    # Aggregate token usage from all agents
+    aggregated_token_usage = aggregate_token_usage(bedrock_clients)
+
     result = {
         "task_id": task_id,
         "instruction": instruction,
@@ -622,7 +683,7 @@ def run_single_task(task_data, args, output_base):
         "forked": len(all_agents) > 1,
         "duration": root_info.get("duration", 0) if root_info else 0,
         "steps": root_info.get("result", {}).get("steps_used", 0) if root_info else 0,
-        "token_usage": bedrock.get_token_usage(),
+        "token_usage": aggregated_token_usage,
         "agents": {
             agent_id: {
                 "status": info["status"],
@@ -631,6 +692,10 @@ def run_single_task(task_data, args, output_base):
             for agent_id, info in all_agents.items()
         }
     }
+
+    # Write token_usage.json (separate file for backward compatibility)
+    with open(os.path.join(output_dir, "token_usage.json"), "w") as f:
+        json.dump(aggregated_token_usage, f, indent=2)
 
     # Evaluate task completion if evaluator is configured
     score = None
