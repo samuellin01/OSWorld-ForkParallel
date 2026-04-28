@@ -383,12 +383,17 @@ def run_fork_agent(
 
         # Take screenshot
         shot = display.screenshot()
+        step_timestamp = time.time()  # Capture exact timestamp when screenshot is taken
         if shot:
             last_screenshot = shot
             if output_dir:
                 shot_path = os.path.join(output_dir, f"step_{step:03d}.png")
                 with open(shot_path, "wb") as f:
                     f.write(shot)
+                # Save timestamp for this step
+                timestamp_path = os.path.join(output_dir, f"step_{step:03d}_timestamp.txt")
+                with open(timestamp_path, "w") as f:
+                    f.write(f"{step_timestamp:.6f}\n")
 
             obs_content: List[Dict[str, Any]] = []
 
