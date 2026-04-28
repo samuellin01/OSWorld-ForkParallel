@@ -393,8 +393,11 @@ def discover_task_ids_from_test_file(task_type: str, test_file: str | None) -> l
 _REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 
-def build_run_cmd(task_id: str, trial_output_dir: str, args: argparse.Namespace) -> list:
-    """Build the subprocess command to run a single task via run_benchmark.py."""
+def build_run_cmd(task_id: str, trial_base_dir: str, args: argparse.Namespace) -> list:
+    """Build the subprocess command to run a single task via run_benchmark.py.
+
+    Note: run_benchmark.py will create a task_{task_id} subdirectory inside trial_base_dir.
+    """
     run_script_path = os.path.join(_REPO_ROOT, "run_benchmark.py")
     cmd = [
         sys.executable,
@@ -405,7 +408,7 @@ def build_run_cmd(task_id: str, trial_output_dir: str, args: argparse.Namespace)
         "--region", args.region,
         "--model", args.model,
         "--max-steps", str(args.max_steps),
-        "--output-dir", trial_output_dir,
+        "--output-dir", trial_base_dir,
     ]
     if args.headless:
         cmd.append("--headless")
@@ -930,10 +933,9 @@ def main() -> None:
                     last_credential_refresh = time.monotonic()
 
             # Build output directory for this trial
-            trial_output_dir = os.path.join(
-                os.path.abspath(args.result_dir), f"trial_{trial_idx}", task_id
-            )
-            os.makedirs(trial_output_dir, exist_ok=True)
+            # run_benchmark.py creates a "task_{task_id}" subdirectory, so pass the parent
+            trial_base_dir = os.path.join(os.path.abspath(args.result_dir), f"trial_{trial_idx}")
+            os.makedirs(trial_base_dir, exist_ok=True)
 
             # Clear cache before each trial to prevent cross-trial contamination
             cache_dir = f"cache/{task_id}"
@@ -944,8 +946,8 @@ def main() -> None:
                 else:
                     logger.info("[dry-run] Would clear cache for task %s", task_id)
 
-            # Build and run the command
-            run_cmd = build_run_cmd(task_id, trial_output_dir, args)
+            # Build and run the command (run_benchmark will create task_{task_id} subdir)
+            run_cmd = build_run_cmd(task_id, trial_base_dir, args)
             run_ok = run_subprocess(
                 run_cmd,
                 timeout=args.task_timeout,
@@ -953,30 +955,51 @@ def main() -> None:
                 description=f"run task {task_id} trial {trial_idx}",
             )
 
+            # The actual output is in task_{task_id} subdirectory
+            trial_output_dir = os.path.join(trial_base_dir, f"task_{task_id}")
+
             trial_score = None
             trial_duration = None
+            trial_instruction = None
 
-            # Read score from result.txt if available
-            result_txt = os.path.join(trial_output_dir, "result.txt")
-            if os.path.isfile(result_txt):
-                try:
-                    with open(result_txt) as fh:
-                        trial_score = float(fh.read().strip())
-                except (ValueError, OSError):
-                    pass
+            if not args.dry_run and os.path.isdir(trial_output_dir):
+                # Read score from result.txt
+                result_txt = os.path.join(trial_output_dir, "result.txt")
+                if os.path.isfile(result_txt):
+                    try:
+                        with open(result_txt) as fh:
+                            trial_score = float(fh.read().strip())
+                    except (ValueError, OSError):
+                        pass
 
-            # Read duration from summary.json if available
-            summary_json = os.path.join(trial_output_dir, "summary.json")
-            if os.path.isfile(summary_json):
-                try:
-                    with open(summary_json) as fh:
-                        summary = json.load(fh)
-                        # Extract duration from first result
-                        if summary.get("results"):
-                            first_result = summary["results"][0]
-                            trial_duration = first_result.get("duration")
-                except (json.JSONDecodeError, OSError, KeyError, IndexError):
-                    pass
+                # Read result.json for duration and instruction
+                result_json = os.path.join(trial_output_dir, "result.json")
+                if os.path.isfile(result_json):
+                    try:
+                        with open(result_json) as fh:
+                            result_data = json.load(fh)
+                            trial_duration = result_data.get("duration")
+                            trial_instruction = result_data.get("instruction")
+                    except (json.JSONDecodeError, OSError):
+                        pass
+
+                # Create task.txt if instruction available
+                if trial_instruction:
+                    task_txt = os.path.join(trial_output_dir, "task.txt")
+                    with open(task_txt, "w") as fh:
+                        fh.write(trial_instruction + "\n")
+
+                # Create token_usage.json from result.json
+                if os.path.isfile(result_json):
+                    try:
+                        with open(result_json) as fh:
+                            result_data = json.load(fh)
+                            token_usage = result_data.get("token_usage", {})
+                            token_usage_json = os.path.join(trial_output_dir, "token_usage.json")
+                            with open(token_usage_json, "w") as fh2:
+                                json.dump(token_usage, fh2, indent=2)
+                    except (json.JSONDecodeError, OSError):
+                        pass
 
             results[task_id]["trials"].append({
                 "trial": trial_idx, "run": run_ok, "score": trial_score,
