@@ -871,6 +871,31 @@ h2 {{
     content: '\U0001F4AD ';
     opacity: 0.6;
 }}
+/* Single-agent layout: side-by-side */
+.display-panel.single-agent {{
+    padding: 20px;
+}}
+.display-content {{
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+    align-items: start;
+}}
+.display-screenshot {{
+    width: 100%;
+}}
+.display-screenshot img {{
+    width: 100%;
+    border-radius: 8px;
+    border: 1px solid #30363d;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+}}
+.display-thinking-container {{
+    min-height: 100px;
+}}
+.single-agent .display-panel-thinking {{
+    margin-top: 0;
+}}
 /* Action Log */
 .action-log {{
     background: linear-gradient(135deg, #161b22 0%, #1c2128 100%);
@@ -1140,19 +1165,37 @@ h2 {{
     h.append("<h2>📺 Displays</h2>")
     h.append("<div class='display-panels'>")
 
+    # Use side-by-side layout for single agent
+    single_agent = len(agent_data) == 1
+
     for agent in agent_data:
         agent_id = agent['id']
         display = agent['display']
         status = agent.get('status', 'unknown')
         status_class = f'agent-status agent-status-{status}'
 
-        h.append(f"  <div class='display-panel' id='panel-{esc(agent_id)}'>")
+        panel_class = 'display-panel single-agent' if single_agent else 'display-panel'
+        h.append(f"  <div class='{panel_class}' id='panel-{esc(agent_id)}'>")
         h.append(f"    <div class='display-panel-header'>")
         h.append(f"      <span><strong>{esc(agent_id)}</strong> (Display {esc(str(display))}) <span class='{status_class}'>{esc(status)}</span></span>")
         h.append(f"      <span class='display-panel-step' id='panel-step-{esc(agent_id)}'>Step —</span>")
         h.append(f"    </div>")
-        h.append(f"    <img id='panel-img-{esc(agent_id)}' src='' alt='No screenshot' style='display:none'>")
-        h.append(f"    <div id='panel-thinking-{esc(agent_id)}' class='display-panel-thinking' style='display:none'></div>")
+
+        if single_agent:
+            # Side-by-side layout
+            h.append(f"    <div class='display-content'>")
+            h.append(f"      <div class='display-screenshot'>")
+            h.append(f"        <img id='panel-img-{esc(agent_id)}' src='' alt='No screenshot' style='display:none'>")
+            h.append(f"      </div>")
+            h.append(f"      <div class='display-thinking-container'>")
+            h.append(f"        <div id='panel-thinking-{esc(agent_id)}' class='display-panel-thinking' style='display:none'></div>")
+            h.append(f"      </div>")
+            h.append(f"    </div>")
+        else:
+            # Stacked layout for multi-agent
+            h.append(f"    <img id='panel-img-{esc(agent_id)}' src='' alt='No screenshot' style='display:none'>")
+            h.append(f"    <div id='panel-thinking-{esc(agent_id)}' class='display-panel-thinking' style='display:none'></div>")
+
         h.append(f"  </div>")
 
     h.append("</div>")
