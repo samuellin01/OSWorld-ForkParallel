@@ -56,17 +56,19 @@ def build_timeline_from_api_calls(api_calls: List[Dict], agent_dirs: List[Tuple[
         if not response_ts_str:
             continue
 
-        # Parse ISO timestamp
+        # Parse timestamps (use request time for step timing, response time for duration)
         try:
             response_ts = datetime.fromisoformat(response_ts_str.replace('Z', '+00:00'))
+            request_ts = datetime.fromisoformat(request_ts_str.replace('Z', '+00:00')) if request_ts_str else response_ts
         except:
             continue
 
         if start_time is None:
-            start_time = response_ts
+            start_time = request_ts
         end_time = response_ts
 
-        relative_time = (response_ts - start_time).total_seconds() if start_time else 0
+        # Use request timestamp for step timing (when action was invoked)
+        relative_time = (request_ts - start_time).total_seconds() if start_time else 0
 
         # Get agent ID directly from log entry (if available)
         agent_id = call.get('agent_id')
@@ -422,7 +424,9 @@ def generate_trajectory_html(
         # Get agent timeline span
         timeline = agent_timeline.get(agent_id, {})
         start_time = timeline.get('start', 0)
-        end_time = timeline.get('end', 0)
+        # Use last step timestamp for end time (not API call end time)
+        # to ensure timeline bars match actual action timestamps
+        end_time = steps[-1]['timestamp'] if steps else timeline.get('end', 0)
 
         agent_info = result_data.get("agents", {}).get(agent_id, {})
         status = agent_info.get("status", "unknown")
