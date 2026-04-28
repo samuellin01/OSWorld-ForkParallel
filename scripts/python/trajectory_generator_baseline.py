@@ -99,19 +99,22 @@ def generate_trajectory_html_baseline(
         screenshot_file = step_dir / "screenshot.png"
         screenshot_url = f"{step_name}/screenshot.png" if screenshot_file.is_file() else ""
 
-        # Action from action log
+        # Action and timestamp from action log
         action = ""
+        timestamp = 0.0
         if step_num - 1 < len(action_log):
             entry = action_log[step_num - 1]
             actions = entry.get("actions", [])
             if actions:
                 action = ", ".join(str(a) for a in actions)
+            timestamp = entry.get("timestamp", 0.0)
 
         steps.append({
             'num': step_num,
             'thinking': thinking,
             'screenshot': screenshot_url,
             'action': action,
+            'timestamp': timestamp,
         })
 
     # Generate HTML
@@ -339,7 +342,7 @@ h1 {
     padding: 10px 12px;
     margin-bottom: 8px;
     display: grid;
-    grid-template-columns: 80px 1fr;
+    grid-template-columns: 140px 1fr;
     gap: 12px;
     font-size: 0.9em;
 }
@@ -425,7 +428,8 @@ h1 {
     h.append("      <h2>📋 Action Log</h2>")
     for i, step in enumerate(steps):
         h.append("      <div class='action-item'>")
-        h.append(f"        <div class='action-step'>Step {step['num']}</div>")
+        time_str = fmt_duration(step['timestamp'])
+        h.append(f"        <div class='action-step'>Step {step['num']} • {time_str}</div>")
         h.append(f"        <div class='action-detail'>{step['action'] if step['action'] else '—'}</div>")
         h.append("      </div>")
     h.append("    </div>")
@@ -444,13 +448,23 @@ let animationId = null;
 let lastFrameTime = null;
 let playbackSpeed = 4;
 
+function formatDuration(secs) {
+    if (secs < 60) {
+        return Math.floor(secs) + 's';
+    }
+    const m = Math.floor(secs / 60);
+    const s = Math.floor(secs % 60);
+    return m + 'm ' + s + 's';
+}
+
 function updateDisplay(stepIndex) {
     if (steps.length === 0) return;
 
     currentStepIndex = Math.max(0, Math.min(Math.floor(stepIndex), steps.length - 1));
     const step = steps[currentStepIndex];
 
-    document.getElementById('timeline-time').textContent = 'Step ' + step.num;
+    const timeStr = formatDuration(step.timestamp);
+    document.getElementById('timeline-time').textContent = 'Step ' + step.num + ' • ' + timeStr;
 
     const progress = steps.length > 1 ? (currentStepIndex / (steps.length - 1)) * 100 : 0;
     document.getElementById('timeline-progress').style.width = progress + '%';
@@ -460,7 +474,7 @@ function updateDisplay(stepIndex) {
     const stepEl = document.getElementById('display-step');
     const thinkingEl = document.getElementById('display-thinking');
 
-    stepEl.textContent = 'Step ' + step.num;
+    stepEl.textContent = 'Step ' + step.num + ' • ' + timeStr;
 
     if (step.screenshot) {
         imgEl.src = imgBase + '/' + step.screenshot;
