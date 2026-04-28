@@ -96,7 +96,7 @@ def parse_args() -> argparse.Namespace:
         help="Task type: standard or collaborative (default: collaborative)",
     )
     parser.add_argument(
-        "--task_type",
+        "--domain",
         type=str,
         default=None,
         help="Domain filter (e.g., chrome, multi_apps, all). If omitted, all tasks are run.",
