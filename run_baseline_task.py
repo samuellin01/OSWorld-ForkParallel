@@ -35,7 +35,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import anthropic
 
-from google_workspace_oauth import create_sheet_from_template_oauth, create_doc_from_template_oauth, get_sheet_id_from_url
+from google_workspace_oauth import (
+    create_sheet_from_template_oauth,
+    create_doc_from_template_oauth,
+    create_slide_from_template_oauth,
+    get_sheet_id_from_url,
+)
 
 # ---------------------------------------------------------------------------
 # Logger
@@ -147,17 +152,21 @@ def _find_domain_for_task_id(task_id: str, base_dir: str) -> Optional[str]:
 
 
 def _process_google_workspace_config(task_data: Dict[str, Any]) -> Dict[str, Any]:
-    """Process google_sheet_from_template and google_doc_from_template config items.
+    """Process google_sheet_from_template, google_doc_from_template, and google_slide_from_template config items.
 
-    Creates fresh Google Sheets/Docs from templates and injects URLs
+    Creates fresh Google Sheets/Docs/Slides from templates and injects URLs
     into the task instruction and evaluator.
 
     Returns modified task_data.
     """
-    if "config" not in task_data:
+    # Check both new format (specific.google_account.config) and old format (config)
+    config_items = task_data.get("specific", {}).get("google_account", {}).get("config", [])
+    if not config_items:
+        config_items = task_data.get("config", [])
+
+    if not config_items:
         return task_data
 
-    config_items = task_data["config"]
     new_config = []
     replacements = {}  # {placeholder: url}
 
@@ -212,6 +221,35 @@ def _process_google_workspace_config(task_data: Dict[str, Any]) -> Dict[str, Any
                 if result_config.get("type") == "google_doc":
                     doc_id = get_sheet_id_from_url(doc_url)  # Same extraction logic
                     result_config["doc_id"] = doc_id
+
+        elif item.get("type") == "google_slide_from_template":
+            params = item["parameters"]
+            template_url = params["template_url"]
+            placeholder = params.get("placeholder", "{SLIDE_URL}")
+            title = params.get("title", f"OSWorld Task Slides {task_data.get('id', 'unknown')}")
+            client_secret_path = params.get("client_secret_path", "oauth_client_secret.json")
+            token_path = params.get("token_path", "oauth_token.pickle")
+
+            logger.info("[setup] Creating Google Slides from template: %s", template_url)
+            slide_url = create_slide_from_template_oauth(
+                template_url=template_url,
+                client_secret_path=client_secret_path,
+                token_path=token_path,
+                title=title
+            )
+            logger.info("[setup] Created slides: %s", slide_url)
+            replacements[placeholder] = slide_url
+
+            # Update evaluator if it references google_slide type
+            if "evaluator" in task_data and "result" in task_data["evaluator"]:
+                result_configs = task_data["evaluator"]["result"]
+                # result can be a single dict or a list
+                if isinstance(result_configs, dict):
+                    result_configs = [result_configs]
+                for result_config in result_configs:
+                    if result_config.get("type") == "google_slide":
+                        slide_id = get_sheet_id_from_url(slide_url)
+                        result_config["slide_id"] = slide_id
         else:
             # Keep other config items as-is
             new_config.append(item)
