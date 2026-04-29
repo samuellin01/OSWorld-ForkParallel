@@ -395,7 +395,7 @@ def run_fork_agent(
         "the same Google Workspace URL simultaneously and see each other's changes live - like a team collaborating "
         "on a shared document. Use this for parallel work on the same file.\n"
         "\n"
-        "Google Workspace: Do NOT use Apps Script (Extensions > Apps Script) - complete tasks through the UI directly.\n" 
+        "Google Workspace: Do NOT use Apps Script (Extensions > Apps Script) - complete tasks through the UI directly.\n"
         "\n"
         "Google Sheets: Arrow keys work for navigation. If clicks aren't selecting cells reliably, "
         "use the Name Box (top-left, shows current cell) - click it, type cell address (e.g., 'B3'), press Enter. "
@@ -406,7 +406,34 @@ def run_fork_agent(
         "regions (different columns, rows, subrows, subcolumns, cell regions, or sheets). Don't do work sequentially "
         "if it can be divided - the setup cost is so low that even small workloads benefit from parallelization.\n"
         "\n"
+        "**Google Sheets parallelism strategies** - Prefer lighter subtasks spread across more agents:\n"
+        "- 10 cells in 1 row/column with known values: Batch-fill in one efficient action (type → Tab → type → Tab). No need to parallelize.\n"
+        "- 10 cells in 1 row/column requiring individual work: Even if contiguous, if each cell needs separate lookup/research/computation, "
+        "parallelize (e.g., 5 workers × 2 cells each). You can't batch what requires separate actions per cell.\n"
+        "- 10 cells in 2 rows: Fork 2 workers, each handles one row. Faster than sequential.\n"
+        "- 10 cells scattered across different regions: Fork 5 workers, each fills 2 cells. Dividing into many small subtasks "
+        "is better than few large subtasks because workers run concurrently. Fork overhead is minimal (~1-2 actions).\n"
+        "- General rule: If cells are contiguous AND you have all values ready to batch-type, do it yourself. Otherwise parallelize "
+        "by dividing into small independent chunks (even if cells are in the same row/column).\n"
+        "\n"
     )
+
+    if not parent_id:
+        # Only root agents can instruct about shared filesystem
+        system_prompt += (
+            "**Shared filesystem for worker communication**: All agents share /tmp on the VM. Workers have separate clipboards, "
+            "so if a worker needs to transfer large/complex content to another location, instruct them to write it to a tmp file "
+            "(e.g., /tmp/data.txt). Then another worker or you can read it. Example workflow:\n"
+            "- Worker 1: 'Find the article text and save it to /tmp/article.txt'\n"
+            "- Worker 2: 'Read /tmp/article.txt and paste it into cell B5 in the spreadsheet'\n"
+            "\n"
+            "Use this pattern when content is large or complex. If the result is simple text (a number, short phrase, URL), "
+            "workers can just report it to you via SUBTASK COMPLETE and you can pass it along. You should be the one instructing "
+            "workers about using tmp files - don't expect them to come up with this themselves.\n"
+            "\n"
+        )
+
+    system_prompt += "\n\n"
 
     system_prompt += (
         "When you complete your task, output TASK COMPLETED followed by a summary. "
