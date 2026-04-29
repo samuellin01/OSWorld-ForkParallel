@@ -38,16 +38,54 @@ class XvfbDisplay:
         self.display = f":{display_num}"
         self.exec_url = f"http://{vm_ip}:{server_port}/setup/execute"
 
-    def screenshot(self) -> bytes:
-        """Capture screenshot from this display."""
+    def _shell(self, cmd: str, timeout: int = 60) -> Optional[dict]:
+        """Execute shell command on VM."""
         import requests
-        resp = requests.get(
-            f"http://{self.vm_ip}:{self.server_port}/screenshot",
-            params={"display": self.display_num},
-            timeout=30
+        try:
+            r = requests.post(
+                self.exec_url,
+                json={"command": cmd, "shell": True},
+                timeout=timeout,
+            )
+            return r.json() if r.status_code == 200 else None
+        except Exception as e:
+            logger.warning("[%s] shell failed: %s", self.display, e)
+            return None
+
+    def screenshot(self) -> Optional[bytes]:
+        """Capture screenshot from this display using multiple fallback methods."""
+        import base64
+        tmp = f"/tmp/fork_shot_{self.display.replace(':', '')}.png"
+
+        # Try pyautogui first
+        shot_result = self._shell(
+            f"DISPLAY={self.display} python3 -c \""
+            f"import pyautogui; pyautogui.screenshot('{tmp}')\" 2>&1"
         )
-        resp.raise_for_status()
-        return resp.content
+
+        # Check if pyautogui worked
+        check = self._shell(f"test -s {tmp} && echo OK || echo FAIL")
+        if not check or "OK" not in check.get("output", ""):
+            # pyautogui failed — try fallback methods
+            err = shot_result.get("output", "") if shot_result else "no response"
+            logger.warning("[%s] pyautogui screenshot failed: %s — trying fallbacks", self.display, err[:150])
+            self._shell(
+                f"DISPLAY={self.display} scrot -o {tmp} 2>/dev/null || "
+                f"DISPLAY={self.display} import -window root {tmp} 2>/dev/null || "
+                f"DISPLAY={self.display} xwd -root -silent 2>/dev/null | "
+                f"convert xwd:- {tmp} 2>/dev/null"
+            )
+
+        # Read the screenshot file
+        result = self._shell(f"base64 -w0 {tmp}")
+        if result and result.get("output"):
+            try:
+                return base64.b64decode(result["output"].strip())
+            except Exception as e:
+                logger.warning("[%s] failed to decode screenshot: %s", self.display, e)
+
+        logger.warning("[%s] screenshot failed — all methods exhausted", self.display)
+        return None
 
     def run_action(self, action_code: str) -> dict:
         """Execute Python action code on this display."""
