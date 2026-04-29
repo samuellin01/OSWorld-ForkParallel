@@ -49,11 +49,16 @@ class XvfbDisplay:
         return resp.content
 
     def run_action(self, action_code: str) -> dict:
-        """Execute action code on this display."""
+        """Execute Python action code on this display."""
         import requests
+        # Prepend DISPLAY environment variable to action code
+        wrapped_code = f"""import os
+os.environ['DISPLAY'] = ':{self.display_num}'
+{action_code}
+"""
         resp = requests.post(
-            f"{self.base_url}/execute",
-            json={"code": action_code, "display": self.display_num},
+            f"{self.base_url}/run_python",
+            json={"code": wrapped_code},
             timeout=120
         )
         resp.raise_for_status()
