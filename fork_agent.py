@@ -432,6 +432,22 @@ def run_fork_agent(
         "Spreadsheets have features like formulas, fill-down (Ctrl+D), batch selection. Adjacent cells can be filled efficiently "
         "with keyboard (type→Tab→type). Multiple agents can open the same sheet URL and see each other's edits in real-time.\n"
         "\n"
+        "**When to parallelize Google Sheets work**:\n"
+        "- Each cell needs independent research/lookup (can't batch, can't formula)\n"
+        "- Cells scattered across sheet (can't navigate efficiently with Tab/arrows)\n"
+        "- After confirming no efficient single-agent approach exists\n"
+        "\n"
+        "**Bundling strategy** (if you decide to parallelize):\n"
+        "- Adjacent cells (same row/column): bundle to 1 agent if they can Tab between them (type→Tab→type)\n"
+        "- Non-adjacent cells: separate agents (navigation overhead = 2+ actions per cell)\n"
+        "- Cells needing research: 1 agent per cell (each requires 5+ actions: search, read, extract, navigate, fill)\n"
+        "\n"
+        "**Examples**:\n"
+        "- 30 blank cells in column B, fill with value above → DON'T parallelize (use formula + fill-down)\n"
+        "- 10 cells in 1 row with known values → 1 agent (type→Tab→Tab...)\n"
+        "- 10 cells, each needs web research → parallelize (8 workers + 2 more after first batch completes)\n"
+        "- 10 cells scattered across different sheets → parallelize (can't batch navigate)\n"
+        "\n"
     )
 
     if not parent_id:
