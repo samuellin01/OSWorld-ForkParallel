@@ -723,37 +723,42 @@ def upload_task_results_to_github(
         logger.warning("No blobs were created for task %s; skipping commit.", task_id)
         return
 
-    # Step 4: Create a new tree with all blobs.
-    try:
-        tree_body = json.dumps({
-            "base_tree": base_tree_sha,
-            "tree": tree_items,
-        }).encode("utf-8")
-        tree_data = _github_api_request(
-            opener, f"{api_base}/git/trees", headers,
-            method="POST", body=tree_body,
-        )
-        new_tree_sha = tree_data["sha"]
-        logger.info("Created tree with %d file(s) (SHA: %s)", len(tree_items), new_tree_sha[:12])
-    except Exception as exc:
-        logger.error("Failed to create tree for task %s: %s", task_id, exc)
-        return
-
-    # Steps 5-6: Create commit and update ref, with retry on race condition.
+    # Steps 4-6: Create tree, commit, and update ref with retry on race condition.
     commit_message = f"Add OSWorld eval results: {task_id}/{config_dir}/{trial_dir}"
     max_ref_retries = 5
     for attempt in range(max_ref_retries):
-        # Re-fetch HEAD on retries (another terminal may have pushed).
+        # Re-fetch HEAD and base tree on retries (need fresh base_tree for new tree)
         if attempt > 0:
             try:
                 ref_data = _github_api_request(
                     opener, f"{api_base}/git/ref/heads/{branch}", headers,
                 )
                 head_commit_sha = ref_data["object"]["sha"]
+                commit_data = _github_api_request(
+                    opener, f"{api_base}/git/commits/{head_commit_sha}", headers,
+                )
+                base_tree_sha = commit_data["tree"]["sha"]
                 logger.info("Retry %d: re-fetched HEAD (SHA: %s)", attempt, head_commit_sha[:12])
             except Exception as exc:
                 logger.error("Retry %d: failed to re-fetch HEAD: %s", attempt, exc)
                 return
+
+        # Create tree (must recreate on retry with updated base_tree)
+        try:
+            tree_body = json.dumps({
+                "base_tree": base_tree_sha,
+                "tree": tree_items,
+            }).encode("utf-8")
+            tree_data = _github_api_request(
+                opener, f"{api_base}/git/trees", headers,
+                method="POST", body=tree_body,
+            )
+            new_tree_sha = tree_data["sha"]
+            if attempt == 0:
+                logger.info("Created tree with %d file(s) (SHA: %s)", len(tree_items), new_tree_sha[:12])
+        except Exception as exc:
+            logger.error("Failed to create tree for task %s: %s", task_id, exc)
+            return
 
         # Create commit with current HEAD as parent.
         try:
