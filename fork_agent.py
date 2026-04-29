@@ -35,13 +35,14 @@ class XvfbDisplay:
         self.vm_ip = vm_ip
         self.server_port = server_port
         self.display_num = display_num
-        self.base_url = f"http://{vm_ip}:{server_port}"
+        self.display = f":{display_num}"
+        self.exec_url = f"http://{vm_ip}:{server_port}/setup/execute"
 
     def screenshot(self) -> bytes:
         """Capture screenshot from this display."""
         import requests
         resp = requests.get(
-            f"{self.base_url}/screenshot",
+            f"http://{self.vm_ip}:{self.server_port}/screenshot",
             params={"display": self.display_num},
             timeout=30
         )
@@ -51,14 +52,25 @@ class XvfbDisplay:
     def run_action(self, action_code: str) -> dict:
         """Execute Python action code on this display."""
         import requests
-        # Prepend DISPLAY environment variable to action code
-        wrapped_code = f"""import os
-os.environ['DISPLAY'] = ':{self.display_num}'
-{action_code}
-"""
+        # Write code to temp file and execute with DISPLAY set
+        tmp = f"/tmp/fork_action_{self.display.replace(':', '')}.py"
+        full_code = (
+            "import pyautogui; import time; pyautogui.FAILSAFE = False\n"
+            + action_code
+        )
+        write_cmd = f"cat > {tmp} << 'ACTIONEOF'\n{full_code}\nACTIONEOF"
+
+        # Write the file
+        requests.post(
+            self.exec_url,
+            json={"command": write_cmd, "shell": True},
+            timeout=30
+        )
+
+        # Execute with DISPLAY environment variable
         resp = requests.post(
-            f"{self.base_url}/run_python",
-            json={"code": wrapped_code},
+            self.exec_url,
+            json={"command": f"DISPLAY={self.display} python3 {tmp}", "shell": True},
             timeout=120
         )
         resp.raise_for_status()
