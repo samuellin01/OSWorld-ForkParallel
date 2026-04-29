@@ -22,9 +22,42 @@ from agent_utils import (
     parse_computer_use_actions,
 )
 from bedrock_client import BedrockClient
-from gui_agent import XvfbDisplay
 
 logger = logging.getLogger(__name__)
+
+
+class XvfbDisplay:
+    """Wrapper for virtual display interactions via VM controller.
+
+    Provides screenshot and action execution on a specific DISPLAY number.
+    """
+    def __init__(self, vm_ip: str, server_port: int, display_num: int):
+        self.vm_ip = vm_ip
+        self.server_port = server_port
+        self.display_num = display_num
+        self.base_url = f"http://{vm_ip}:{server_port}"
+
+    def screenshot(self) -> bytes:
+        """Capture screenshot from this display."""
+        import requests
+        resp = requests.get(
+            f"{self.base_url}/screenshot",
+            params={"display": self.display_num},
+            timeout=30
+        )
+        resp.raise_for_status()
+        return resp.content
+
+    def run_action(self, action_code: str) -> dict:
+        """Execute action code on this display."""
+        import requests
+        resp = requests.post(
+            f"{self.base_url}/execute",
+            json={"code": action_code, "display": self.display_num},
+            timeout=120
+        )
+        resp.raise_for_status()
+        return resp.json()
 
 
 # Fork tool definition
