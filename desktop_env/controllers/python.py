@@ -145,7 +145,7 @@ class PythonController:
         for _ in range(self.retry_times):
             try:
                 response = requests.post(self.http_server + "/execute", headers={'Content-Type': 'application/json'},
-                                         data=payload, timeout=120)
+                                         data=payload, timeout=300)
                 if response.status_code == 200:
                     logger.info("Command executed successfully: %s", response.text)
                     return response.json()
@@ -171,7 +171,7 @@ class PythonController:
         for _ in range(self.retry_times):
             try:
                 response = requests.post(self.http_server + "/run_python", headers={'Content-Type': 'application/json'},
-                                         data=payload, timeout=90)
+                                         data=payload, timeout=300)
                 if response.status_code == 200:
                     return response.json()
                 else:
