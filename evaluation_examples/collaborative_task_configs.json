@@ -180,15 +180,6 @@
       "baseline_time_seconds": null,
       "description": "Download CS50 Python course lecture PDFs from website"
     },
-    "1f18aa87-collaborative": {
-      "name": "grammar_test_answers",
-      "osworld_original": "1f18aa87-af6f-41ef-9853-cdb8f32ebdea",
-      "config_file": "tasks/1f18aa87-collaborative.json",
-      "type": "multi_app",
-      "status": "active",
-      "baseline_time_seconds": null,
-      "description": "Write grammar test answers in Google Doc following format from Test 1"
-    },
     "20236825-collaborative": {
       "name": "bubble_sort_coding",
       "osworld_original": "20236825-b5df-46e7-89bf-62e1d640a897",
@@ -265,7 +256,7 @@
   "metadata": {
     "version": "1.0",
     "created": "2026-04-23",
-    "updated": "2026-04-28",
-    "total_tasks": 28
+    "updated": "2026-04-29",
+    "total_tasks": 27
   }
 }
