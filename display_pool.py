@@ -87,13 +87,37 @@ class DisplayPool:
         # Install prerequisites (if not already present)
         logger.info("Ensuring display prerequisites installed...")
         result = self.vm_exec(
-            "which Xvfb scrot openbox xterm xdotool tint2 > /dev/null 2>&1 || "
+            "which Xvfb scrot openbox xterm xdotool > /dev/null 2>&1 || "
             f"(echo '{self.password}' | sudo -S apt-get update -qq && "
-            f"echo '{self.password}' | sudo -S apt-get install -y xvfb scrot openbox xterm xdotool tint2)"
+            f"echo '{self.password}' | sudo -S apt-get install -y xvfb scrot openbox xterm xdotool)"
         )
         if not result or result.get("returncode") != 0:
             logger.error("Failed to install display prerequisites")
             return False
+
+        # Configure openbox keyboard shortcut for terminal recovery
+        logger.info("Configuring openbox keyboard shortcuts...")
+        openbox_config = """<?xml version="1.0" encoding="UTF-8"?>
+<openbox_config xmlns="http://openbox.org/3.4/rc">
+  <keyboard>
+    <!-- Launch terminal with Ctrl+Alt+T -->
+    <keybind key="C-A-t">
+      <action name="Execute">
+        <command>xterm</command>
+      </action>
+    </keybind>
+  </keyboard>
+</openbox_config>
+"""
+        config_cmd = (
+            "mkdir -p ~/.config/openbox && "
+            f"cat > ~/.config/openbox/rc.xml << 'OBEOF'\n{openbox_config}\nOBEOF"
+        )
+        result = self.vm_exec(config_cmd)
+        if not result or result.get("returncode") != 0:
+            logger.warning("Failed to configure openbox shortcuts (non-critical)")
+        else:
+            logger.info("✓ Openbox shortcuts configured (Ctrl+Alt+T=terminal)")
 
         # Start each display
         success_count = 0
@@ -117,13 +141,12 @@ class DisplayPool:
         """
         logger.info(f"Starting display :{display_num}...")
 
-        # Start Xvfb + openbox + taskbar + set background
+        # Start Xvfb + openbox + set background (no taskbar for cleaner display)
         cmd = (
             f"export DISPLAY=:{display_num}; "
             f"nohup Xvfb :{display_num} -screen 0 1920x1080x24 -ac >/dev/null 2>&1 & sleep 2; "
             f"nohup openbox >/dev/null 2>&1 & sleep 1; "
             f"xsetroot -solid '#2C3E50' || true; "
-            f"nohup tint2 >/dev/null 2>&1 & sleep 0.5; "
         )
 
         result = self.vm_exec(cmd)
