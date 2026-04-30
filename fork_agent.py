@@ -134,7 +134,7 @@ FORK_TOOL: Dict[str, Any] = {
         "Setup config examples:\n"
         "- Web tasks: {\"type\": \"chrome_open_tabs\", \"parameters\": {\"urls_to_open\": [\"https://docs.google.com/...\"]}}\n"
         "- File editing: {\"type\": \"launch\", \"parameters\": {\"command\": [\"gedit\", \"/tmp/file.txt\"]}}\n"
-        "- Terminal work: {\"type\": \"launch\", \"parameters\": {\"command\": [\"xterm\", \"-geometry\", \"240x60\"]}}\n"
+        "- Terminal work: {\"type\": \"launch\", \"parameters\": {\"command\": [\"gnome-terminal\", \"--maximize\"]}}\n"
         "- Spreadsheets: {\"type\": \"launch\", \"parameters\": {\"command\": [\"libreoffice\", \"--calc\", \"/tmp/data.xlsx\"]}}\n"
         "- Prepare directory: {\"type\": \"command\", \"parameters\": {\"command\": \"mkdir -p /tmp/workspace\"}}\n"
         "- Download file: {\"type\": \"download\", \"parameters\": {\"files\": [{\"path\": \"/tmp/data.csv\", \"url\": \"https://...\"}]}}\n"
@@ -143,7 +143,7 @@ FORK_TOOL: Dict[str, Any] = {
         "- Google Sheets task → chrome_open_tabs with sheet URL + sleep 3s\n"
         "- Web research → chrome_open_tabs with search URL\n"
         "- File processing → launch appropriate app + download if needed\n"
-        "- Command-line → launch large xterm"
+        "- Command-line → launch gnome-terminal --maximize"
     ),
     "input_schema": {
         "type": "object",
