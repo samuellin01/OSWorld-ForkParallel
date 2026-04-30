@@ -312,6 +312,11 @@ class AgentRuntime:
                 logger.error(f"Cannot kill: {killer_id} is not parent of {agent_id}")
                 return
 
+            # Don't overwrite terminal states
+            if agent.status in [AgentStatus.COMPLETED, AgentStatus.FAILED]:
+                logger.info(f"Agent {agent_id} already {agent.status.value}, ignoring kill request")
+                return
+
             agent.status = AgentStatus.KILLED
             agent.end_time = time.time()
 
