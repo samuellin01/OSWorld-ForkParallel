@@ -87,9 +87,9 @@ class DisplayPool:
         # Install prerequisites (if not already present)
         logger.info("Ensuring display prerequisites installed...")
         result = self.vm_exec(
-            "which Xvfb scrot openbox gnome-terminal xdotool > /dev/null 2>&1 || "
+            "which Xvfb scrot openbox xterm xdotool > /dev/null 2>&1 || "
             f"(echo '{self.password}' | sudo -S apt-get update -qq && "
-            f"echo '{self.password}' | sudo -S apt-get install -y xvfb scrot openbox gnome-terminal dbus-x11 xdotool)"
+            f"echo '{self.password}' | sudo -S apt-get install -y xvfb scrot openbox xterm xdotool)"
         )
         if not result or result.get("returncode") != 0:
             logger.error("Failed to install display prerequisites")
@@ -103,7 +103,7 @@ class DisplayPool:
     <!-- Launch terminal with Ctrl+Alt+T -->
     <keybind key="C-A-t">
       <action name="Execute">
-        <command>dbus-launch gnome-terminal</command>
+        <command>xterm -fa 'Monospace' -fs 14 -geometry 200x50 -xrm 'XTerm*selectToClipboard: true'</command>
       </action>
     </keybind>
   </keyboard>
@@ -117,7 +117,7 @@ class DisplayPool:
         if not result or result.get("returncode") != 0:
             logger.warning("Failed to configure openbox shortcuts (non-critical)")
         else:
-            logger.info("✓ Openbox shortcuts configured (Ctrl+Alt+T=gnome-terminal)")
+            logger.info("✓ Openbox shortcuts configured (Ctrl+Alt+T=xterm)")
 
         # Start each display
         success_count = 0
