@@ -159,10 +159,10 @@ def _process_google_workspace_config(task_data: Dict[str, Any]) -> Dict[str, Any
 
     Returns modified task_data.
     """
-    # Check both new format (specific.google_account.config) and old format (config)
-    config_items = task_data.get("specific", {}).get("google_account", {}).get("config", [])
-    if not config_items:
-        config_items = task_data.get("config", [])
+    # Merge base config and google_account config
+    base_config = task_data.get("config", [])
+    google_config = task_data.get("specific", {}).get("google_account", {}).get("config", [])
+    config_items = base_config + google_config
 
     if not config_items:
         return task_data
