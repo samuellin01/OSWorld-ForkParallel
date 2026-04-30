@@ -86,9 +86,11 @@ class DisplayPool:
 
         # Install prerequisites (if not already present)
         logger.info("Ensuring display prerequisites installed...")
+        # Use longer timeout (5 min) for package installation through fwdproxy
         result = self.vm_exec(
             "which Xvfb scrot openbox xterm xdotool > /dev/null 2>&1 || "
-            f"echo '{self.password}' | sudo -S apt-get install -y xvfb scrot openbox xterm xdotool"
+            f"(echo '{self.password}' | sudo -S apt-get install -y xvfb scrot openbox xterm xdotool)",
+            timeout=300
         )
         if not result or result.get("returncode") != 0:
             logger.error("Failed to install display prerequisites")
