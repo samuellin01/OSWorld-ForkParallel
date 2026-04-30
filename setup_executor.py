@@ -167,10 +167,6 @@ class SetupExecutor:
         if isinstance(command, list):
             command = " ".join(command)
 
-        # GNOME applications need dbus-launch in Xvfb environment
-        if "gnome-terminal" in command or "gedit" in command:
-            command = f"dbus-launch {command}"
-
         cmd = f"{self.display_env} nohup {command} >/dev/null 2>&1 &"
         result = self.vm_exec(cmd)
         time.sleep(1.5)  # Give app time to start
