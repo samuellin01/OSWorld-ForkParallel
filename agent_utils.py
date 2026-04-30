@@ -252,7 +252,7 @@ def parse_computer_use_actions(
                     # to prevent character dropping in terminals.
                     for i in range(0, len(text), 50):
                         chunk = text[i:i + 50]
-                        result += f"import subprocess, shlex; subprocess.run(f'xdotool type --delay 12 -- ' + shlex.quote({repr(chunk)}), shell=True, check=True)\n"
+                        result += f"import subprocess, shlex; subprocess.run(f'xdotool type --delay 5 -- ' + shlex.quote({repr(chunk)}), shell=True, check=True)\n"
                         result += "import time; time.sleep(0.05)\n"
         elif action == "scroll":
             if text:
