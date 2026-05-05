@@ -3,6 +3,13 @@
 Replaces the fork-based agent runtime with a structured DAG scheduler that
 extracts parallelism from task decomposition and assigns ready nodes to
 available execution slots (displays).
+
+Architecture:
+- Coarse nodes (depth 0) each get their own display and run in parallel
+- A worker on a display decomposes its node into a sub-DAG of finer steps
+- The worker then executes the sub-DAG sequentially on its own display,
+  recursing until it reaches atomic computer-use actions (click, type, key)
+- Parallelism comes from multiple coarse nodes running on different displays
 """
 
 from __future__ import annotations
@@ -24,7 +31,7 @@ class DAGNode:
     id: str
     task_description: str
     depends_on: List[str] = field(default_factory=list)
-    status: str = "pending"  # pending | running | done | failed | expanding
+    status: str = "pending"  # pending | running | done | failed
     result: Optional[Dict[str, Any]] = None
     agent_id: Optional[str] = None
     display_num: Optional[int] = None
@@ -33,37 +40,25 @@ class DAGNode:
     setup_config: List[Dict[str, Any]] = field(default_factory=list)
     max_steps: int = 30
     start_time: Optional[float] = None
-    timeout_seconds: float = 300.0
+    timeout_seconds: float = 600.0
     retry_count: int = 0
-    max_retries: int = 2
+    max_retries: int = 1
 
 
 @dataclass
 class DAGState:
     nodes: Dict[str, DAGNode] = field(default_factory=dict)
     root_task: str = ""
-    max_depth: int = 2
+    max_depth: int = 3
     created_at: float = field(default_factory=time.time)
 
 
-class DAGSchedulerCallback:
-    """Interface for workers to report back to the scheduler."""
+class DAGScheduler:
+    """Scheduler that dispatches coarse DAG nodes to display slots.
 
-    def report_completion(self, node_id: str, result: Dict[str, Any]):
-        raise NotImplementedError
-
-    def report_failure(self, node_id: str, error: str):
-        raise NotImplementedError
-
-    def report_expansion(self, node_id: str, sub_dag_plan: List[Dict[str, Any]]):
-        raise NotImplementedError
-
-
-class DAGScheduler(DAGSchedulerCallback):
-    """Scheduler that dispatches ready DAG nodes to worker slots.
-
-    Main loop: find ready nodes -> assign to free displays -> wait for
-    completions -> handle results -> repeat until DAG is complete.
+    Each coarse node gets its own display. The worker on that display
+    handles further decomposition and sequential execution internally.
+    Parallelism comes from multiple coarse nodes running simultaneously.
     """
 
     def __init__(
@@ -76,7 +71,6 @@ class DAGScheduler(DAGSchedulerCallback):
         vm_ip: str,
         server_port: int,
         output_dir: str,
-        revision_interval: float = 60.0,
         task_timeout: float = 1200.0,
         password: str = "osworld-public-evaluation",
     ):
@@ -88,7 +82,6 @@ class DAGScheduler(DAGSchedulerCallback):
         self.vm_ip = vm_ip
         self.server_port = server_port
         self.output_dir = output_dir
-        self.revision_interval = revision_interval
         self.task_timeout = task_timeout
         self.password = password
 
@@ -117,26 +110,12 @@ class DAGScheduler(DAGSchedulerCallback):
                     ready.append(node)
         return ready
 
-    def _get_free_display(self) -> Optional[int]:
-        return self.display_pool.allocate(agent_id="dag_worker")
-
     def _is_complete(self) -> bool:
         with self._lock:
             return all(
                 n.status in ("done", "failed")
                 for n in self.dag.nodes.values()
             )
-
-    def _has_failed_terminal(self) -> bool:
-        """Check if any terminal node (nothing depends on it) has failed."""
-        with self._lock:
-            depended_on = set()
-            for n in self.dag.nodes.values():
-                depended_on.update(n.depends_on)
-            for n in self.dag.nodes.values():
-                if n.id not in depended_on and n.status == "failed":
-                    return True
-        return False
 
     def _check_timeouts(self):
         now = time.time()
@@ -161,25 +140,19 @@ class DAGScheduler(DAGSchedulerCallback):
         return results
 
     def _assign_node(self, node: DAGNode) -> bool:
-        """Assign a node to a free display and start a worker thread."""
-        display_num = self._get_free_display()
+        """Assign a coarse node to a free display and start a worker thread."""
+        display_num = self.display_pool.allocate(agent_id=f"worker_{node.id}")
         if display_num is None:
             return False
 
-        executor = SetupExecutor(display_num=display_num, vm_exec=self.vm_exec)
         if node.setup_config:
+            executor = SetupExecutor(display_num=display_num, vm_exec=self.vm_exec)
             setup_ok = executor.execute_config(node.setup_config)
             if not setup_ok:
-                logger.error("Setup failed for node %s on display :%d", node.id, display_num)
-                self.display_pool.release(display_num)
-                with self._lock:
-                    if node.retry_count < node.max_retries:
-                        node.retry_count += 1
-                        node.status = "pending"
-                        logger.info("Retrying node %s (attempt %d)", node.id, node.retry_count)
-                    else:
-                        self._handle_failure_locked(node, "setup_failed_after_retries")
-                return False
+                logger.warning(
+                    "Setup failed for node %s on display :%d, proceeding anyway",
+                    node.id, display_num,
+                )
 
         with self._lock:
             node.status = "running"
@@ -225,7 +198,6 @@ class DAGScheduler(DAGSchedulerCallback):
             from dag_worker import run_dag_worker
             result = run_dag_worker(
                 node=node,
-                scheduler_callback=self,
                 vm_ip=self.vm_ip,
                 server_port=self.server_port,
                 bedrock=bedrock,
@@ -235,42 +207,38 @@ class DAGScheduler(DAGSchedulerCallback):
                 dependency_results=dep_results,
                 max_depth=self.dag.max_depth,
             )
-            if node.status == "expanding":
-                return
-            if result.get("status") == "DONE":
-                self.report_completion(node.id, result)
-            else:
-                self.report_failure(node.id, result.get("summary", "unknown error"))
+            self._report_completion(node.id, result)
         except Exception as e:
             logger.error("Worker for node %s crashed: %s", node.id, e, exc_info=True)
-            self.report_failure(node.id, str(e))
+            self._report_failure(node.id, str(e))
 
-    def report_completion(self, node_id: str, result: Dict[str, Any]):
+    def _report_completion(self, node_id: str, result: Dict[str, Any]):
         with self._lock:
             node = self.dag.nodes.get(node_id)
-            if not node:
+            if not node or node.status in ("done", "failed"):
                 return
-            if node.status in ("done", "failed"):
-                return
-            node.status = "done"
-            node.result = result
+
+            if result.get("status") == "DONE":
+                node.status = "done"
+                node.result = result
+                duration = time.time() - (node.start_time or time.time())
+                logger.info("Node %s completed (%.1fs)", node_id, duration)
+            else:
+                self._handle_failure_locked(node, result.get("summary", "unknown"))
 
             if node.display_num is not None and node.display_num > 0:
                 self.display_pool.release(node.display_num)
 
-            duration = time.time() - (node.start_time or time.time())
-            logger.info("Node %s completed (%.1fs)", node_id, duration)
-
         self._completion_event.set()
 
-    def report_failure(self, node_id: str, error: str):
+    def _report_failure(self, node_id: str, error: str):
         with self._lock:
             node = self.dag.nodes.get(node_id)
-            if not node:
-                return
-            if node.status in ("done", "failed"):
+            if not node or node.status in ("done", "failed"):
                 return
             self._handle_failure_locked(node, error)
+            if node.display_num is not None and node.display_num > 0:
+                self.display_pool.release(node.display_num)
         self._completion_event.set()
 
     def _handle_failure_locked(self, node: DAGNode, error: str):
@@ -285,87 +253,18 @@ class DAGScheduler(DAGSchedulerCallback):
             node.start_time = None
             logger.info(
                 "Node %s failed (%s), retrying (attempt %d/%d)",
-                node.id, error, node.retry_count, node.max_retries,
+                node.id, error[:200], node.retry_count, node.max_retries,
             )
             return
 
         node.status = "failed"
         node.result = {"error": error}
-        if node.display_num is not None and node.display_num > 0:
-            self.display_pool.release(node.display_num)
-
-        logger.error("Node %s failed permanently: %s", node.id, error)
+        logger.error("Node %s failed permanently: %s", node.id, error[:200])
 
         for other in self.dag.nodes.values():
             if node.id in other.depends_on and other.status == "pending":
                 logger.warning("Cascading failure to downstream node %s", other.id)
                 self._handle_failure_locked(other, "cascade")
-
-    def report_expansion(self, node_id: str, sub_dag_plan: List[Dict[str, Any]]):
-        with self._lock:
-            node = self.dag.nodes.get(node_id)
-            if not node:
-                return
-            node.status = "expanding"
-            if node.display_num is not None and node.display_num > 0:
-                self.display_pool.release(node.display_num)
-                node.display_num = None
-            self._expand_node(node, sub_dag_plan)
-        self._completion_event.set()
-
-    def _expand_node(self, node: DAGNode, sub_dag_plan: List[Dict[str, Any]]):
-        """Replace a node with its sub-DAG. Must be called with self._lock held."""
-        sub_nodes = []
-        for step in sub_dag_plan:
-            sub_id = f"{node.id}__{step['id']}"
-            sub_deps = [f"{node.id}__{d}" for d in step.get("depends_on", [])]
-            sub_node = DAGNode(
-                id=sub_id,
-                task_description=step["task"],
-                depends_on=sub_deps if sub_deps else list(node.depends_on),
-                status="pending",
-                parent_node_id=node.id,
-                depth=node.depth + 1,
-                setup_config=step.get("setup", []),
-                max_steps=step.get("max_steps", node.max_steps),
-                timeout_seconds=node.timeout_seconds,
-                max_retries=node.max_retries,
-            )
-            sub_nodes.append(sub_node)
-
-        all_sub_ids = {sn.id for sn in sub_nodes}
-        depended_on = set()
-        for sn in sub_nodes:
-            depended_on.update(d for d in sn.depends_on if d in all_sub_ids)
-        terminal_ids = list(all_sub_ids - depended_on)
-
-        for sn in sub_nodes:
-            has_internal_deps = any(d in all_sub_ids for d in sn.depends_on)
-            if not has_internal_deps:
-                sn.depends_on = list(node.depends_on)
-            else:
-                sn.depends_on = [
-                    d for d in sn.depends_on if d in all_sub_ids
-                ] + [
-                    d for d in node.depends_on
-                    if d not in all_sub_ids
-                    and all(d not in sn2.depends_on for sn2 in sub_nodes if sn2.id != sn.id)
-                ]
-
-        for other in self.dag.nodes.values():
-            if node.id in other.depends_on:
-                other.depends_on.remove(node.id)
-                other.depends_on.extend(terminal_ids)
-
-        for sn in sub_nodes:
-            self.dag.nodes[sn.id] = sn
-
-        del self.dag.nodes[node.id]
-
-        logger.info(
-            "Expanded node %s into %d sub-nodes (terminals: %s)",
-            node.id, len(sub_nodes), terminal_ids,
-        )
 
     def run(self) -> Dict[str, Any]:
         """Main scheduler loop. Blocks until DAG is complete or timeout."""
