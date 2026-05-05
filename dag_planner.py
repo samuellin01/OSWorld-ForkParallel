@@ -1,12 +1,13 @@
 """LLM-based DAG planner for hierarchical task decomposition (spec §1).
 
-Called at two points:
-1. Once at the root to produce the initial coarse DAG
-2. By each worker before executing, to decide decompose-or-execute and
-   produce a finer sub-DAG if decomposing
+Called at every level of the hierarchy:
+- Root: task -> coarse parallel/sequential subtasks
+- Worker: subtask -> finer subtasks (if decomposable)
+- Recursion until leaf nodes are small enough for a single CUA agent
 
-The planner always outputs the same format: a list of steps with dependency
-edges. The scheduler merges sub-DAGs into the global DAG (spec §4).
+The planner outputs both parallel AND sequential subtasks. Sequential
+subtasks share a display (the scheduler detects chains from depends_on).
+Parallel subtasks get separate displays.
 """
 
 from __future__ import annotations
@@ -20,60 +21,50 @@ from dag_core import DAGNode, DAGState
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Planner prompt — used at every level of decomposition
-# ---------------------------------------------------------------------------
-
 _PLANNER_SYSTEM_PROMPT = """\
 You are a task decomposition planner for a multi-agent computer-use system.
 
-The system has multiple virtual displays (slots). Each subtask you create will \
-be assigned to a separate display and executed by an independent CUA agent \
-IN PARALLEL with other ready subtasks. Agents on different displays cannot \
-see each other's screens.
+The system has multiple virtual displays (slots). Break the task into subtasks. \
+The scheduler will automatically detect which subtasks are parallel vs sequential:
 
-Break the given task into subtasks that maximize parallelism. Each subtask \
-should be a coherent unit of work that one CUA agent can complete on its \
-own display (open apps, navigate, click, type, etc.).
+- **Parallel subtasks** (no depends_on between them): run simultaneously on \
+SEPARATE displays. Agents cannot see each other's screens.
+- **Sequential subtasks** (connected by depends_on): run one after another on \
+the SAME display. The display state (open windows, tabs, cursor position) \
+carries over. The later step sees exactly what the earlier step left on screen.
 
 Output a JSON list. Each element has:
 - "id": short identifier (e.g., "step_0")
-- "task": clear, self-contained description of what the agent should accomplish. \
-Include ALL information the agent needs — it cannot see other agents' screens. \
-If the agent needs data from a prior step, say "using the result from step X" \
-and the system will inject that result.
-- "depends_on": list of step IDs that must complete first (empty = can start immediately). \
-Use this to express true data dependencies. Steps with no dependencies run in parallel.
-- "setup": list of setup actions to prepare the display BEFORE the agent starts \
-(see types below). CRITICAL: agents spawn on EMPTY displays.
-- "max_steps": estimated number of computer-use actions needed (default 30)
+- "task": clear, self-contained description. Include ALL information the agent \
+needs. If data from a prior step is needed, say so — the system injects prior results.
+- "depends_on": list of step IDs that must complete first (empty = can start immediately)
+- "setup": list of setup actions for the display BEFORE the agent starts. \
+Only needed for steps that START on a fresh display (first step in a parallel \
+branch). Sequential continuations (depends_on a prior step on the same display) \
+should have empty setup since the display carries over.
+- "max_steps": estimated number of computer-use actions (default 30)
 
-Setup types:
+Setup types (only for steps starting on a fresh display):
 - {{"type": "chrome_open_tabs", "parameters": {{"urls_to_open": ["https://..."]}}}}
 - {{"type": "launch", "parameters": {{"command": ["app", "arg1", ...]}}}}
-- {{"type": "command", "parameters": {{"command": "shell command string"}}}}
 - {{"type": "sleep", "parameters": {{"seconds": 3}}}}
 
 Guidelines:
-- MAXIMIZE PARALLEL WORK: if two subtasks don't need each other's output, \
-make them independent (no depends_on between them).
-- Google Workspace: multiple agents CAN open the same Google Doc/Sheet/Slides \
-URL simultaneously and edit collaboratively in real-time. Use this for parallel \
-editing — assign each agent a specific section/cells to avoid conflicts.
-- Don't over-split: tasks with < 3 actions aren't worth a separate slot.
-- If the task is simple enough for one agent, return a single step.
-- Every step MUST have setup — displays start empty.
+- Google Workspace: multiple agents CAN open the same Doc/Sheet/Slides URL \
+on different displays and edit collaboratively in real-time.
+- Maximize parallelism where work is truly independent.
+- Use sequential dependencies when step B needs to see step A's screen state \
+or needs step A's output data.
+- Don't over-split: if a single CUA agent can handle the whole thing in \
+~15-30 actions, return a single step.
+- Each parallel branch needs setup. Sequential continuations do NOT.
 
 Output ONLY the JSON list, no other text."""
 
 
-# ---------------------------------------------------------------------------
-# Decomposition check (spec §1 "atomic detection")
-# ---------------------------------------------------------------------------
-
 _DECOMPOSE_CHECK_PROMPT = """\
-You are deciding whether a subtask should be further decomposed into \
-multiple parallel subtasks, or executed directly by a single CUA agent.
+You are deciding whether a subtask should be further decomposed or executed \
+directly by a single CUA (computer-use) agent.
 
 Subtask: {task_description}
 Context from completed dependencies: {context}
@@ -82,14 +73,16 @@ The CUA agent can take screenshots, reason about what it sees, and perform \
 actions (click, type, key press, scroll). It has a budget of {max_steps} actions.
 
 Should this subtask be:
-- EXECUTE directly by one CUA agent (it's a coherent unit of work)
-- DECOMPOSE into multiple parallel subtasks (it contains independent parts \
-  that different agents could work on simultaneously on separate displays)
+- EXECUTE: a single CUA agent handles it directly (coherent unit of work, \
+  one screen, ~{max_steps} or fewer actions)
+- DECOMPOSE: break into subtasks — either parallel parts on separate displays, \
+  or sequential phases where intermediate results matter, or a mix
 
-Only answer DECOMPOSE if there are genuinely independent sub-parts that \
-benefit from parallelism. Sequential steps on the same display don't benefit.
+Answer DECOMPOSE if there are genuinely independent sub-parts that benefit \
+from parallelism, or distinct phases with different setup needs.
+Answer EXECUTE if one agent can see the screen and handle it.
 
-Answer with ONLY one word: "EXECUTE" or "DECOMPOSE"."""
+Answer with ONLY one word: EXECUTE or DECOMPOSE"""
 
 
 def plan_dag(
@@ -99,11 +92,7 @@ def plan_dag(
     context: Optional[str] = None,
     temperature: float = 0.3,
 ) -> List[Dict[str, Any]]:
-    """Produce a DAG plan for a task via LLM.
-
-    Used both for initial root planning and for sub-DAG planning at any depth.
-    Returns a list of step dicts with id, task, depends_on, setup, max_steps.
-    """
+    """Produce a DAG plan for a task. Used at every decomposition level."""
     user_msg = f"Task: {task_description}"
     if context:
         user_msg += f"\n\nContext from completed prior steps:\n{context}"
@@ -152,8 +141,7 @@ def should_decompose(
     max_steps: int = 30,
     temperature: float = 0.3,
 ) -> bool:
-    """Ask the LLM whether a subtask should be decomposed into parallel parts
-    or executed directly by a single CUA agent (spec §1 atomic detection)."""
+    """Ask the LLM whether a subtask should be decomposed further."""
     prompt = _DECOMPOSE_CHECK_PROMPT.format(
         task_description=task_description,
         context=context or "(none)",
@@ -176,7 +164,7 @@ def should_decompose(
     ).strip().upper()
 
     result = "DECOMPOSE" in response_text
-    logger.info("Decompose check: %s → %s", task_description[:60], "DECOMPOSE" if result else "EXECUTE")
+    logger.info("Decompose check: %s -> %s", task_description[:60], "DECOMPOSE" if result else "EXECUTE")
     return result
 
 
@@ -199,17 +187,11 @@ def convert_plan_to_dag_state(
         )
         nodes[node_id] = node
 
-    return DAGState(
-        nodes=nodes,
-        root_task=root_task,
-        max_depth=max_depth,
-    )
+    return DAGState(nodes=nodes, root_task=root_task, max_depth=max_depth)
 
 
 def _parse_plan_json(text: str) -> List[Dict[str, Any]]:
-    """Extract JSON list from LLM response text."""
     text = text.strip()
-
     match = re.search(r'```(?:json)?\s*(\[.*?\])\s*```', text, re.DOTALL)
     if match:
         text = match.group(1)
@@ -218,7 +200,6 @@ def _parse_plan_json(text: str) -> List[Dict[str, Any]]:
         end = text.rfind(']')
         if start != -1 and end != -1:
             text = text[start:end + 1]
-
     try:
         result = json.loads(text)
         if isinstance(result, list):
@@ -226,14 +207,11 @@ def _parse_plan_json(text: str) -> List[Dict[str, Any]]:
     except json.JSONDecodeError as e:
         logger.error("Failed to parse plan JSON: %s", e)
         logger.debug("Raw text: %s", text[:500])
-
     return []
 
 
 def _validate_plan(plan: List[Dict[str, Any]]):
-    """Validate and fix common issues in the plan."""
     ids = {step.get("id") for step in plan}
-
     for step in plan:
         if "id" not in step:
             step["id"] = f"step_{plan.index(step)}"
