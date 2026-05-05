@@ -1,4 +1,4 @@
-# OSWorld-ForkParallel
+# osworld-dag-scheduler
 
 Research fork of [OSWorld](https://github.com/xlang-ai/OSWorld) exploring **fork-parallel multi-agent execution** for computer-use tasks.
 
@@ -44,8 +44,8 @@ User Task → Parent Agent → Fork Child Agents → Parallel Execution → Merg
 ### Setup
 ```bash
 # Clone repository
-git clone https://github.com/samuellin01/OSWorld-ForkParallel.git
-cd OSWorld-ForkParallel
+git clone https://github.com/samuellin01/osworld-dag-scheduler.git
+cd osworld-dag-scheduler
 
 # Install dependencies
 pip install -e .
@@ -182,7 +182,7 @@ Both configurations track:
 ## Project Structure
 
 ```
-OSWorld-ForkParallel/
+osworld-dag-scheduler/
 ├── run_baseline_task.py              # Single-agent task runner
 ├── run_benchmark.py                  # Fork-parallel task runner
 ├── fork_agent.py                     # Fork-parallel agent implementation
