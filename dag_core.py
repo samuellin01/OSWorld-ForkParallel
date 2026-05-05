@@ -1,20 +1,17 @@
-"""Core data structures and scheduler for DAG-based parallel agent execution.
+"""Core data structures and scheduler for hierarchical DAG-based parallel execution.
 
-Replaces the fork-based agent runtime with a structured DAG scheduler that
-extracts parallelism from task decomposition and assigns ready nodes to
-available execution slots (displays).
-
-Architecture:
-- Coarse nodes (depth 0) each get their own display and run in parallel
-- A worker on a display decomposes its node into a sub-DAG of finer steps
-- The worker then executes the sub-DAG sequentially on its own display,
-  recursing until it reaches atomic computer-use actions (click, type, key)
-- Parallelism comes from multiple coarse nodes running on different displays
+Architecture (from spec):
+  - Scheduler maintains a global merged DAG
+  - Assigns ready nodes to free slots (displays)
+  - Workers either decompose (expand node → sub-DAG merged back) or execute
+  - Recursive decomposition until nodes are atomic CUA agent tasks
+  - Parallelism extracted at every level of the hierarchy
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -54,11 +51,17 @@ class DAGState:
 
 
 class DAGScheduler:
-    """Scheduler that dispatches coarse DAG nodes to display slots.
+    """Scheduler that maintains a global DAG, assigns ready nodes to slots,
+    and handles node expansion (sub-DAG merging) from workers.
 
-    Each coarse node gets its own display. The worker on that display
-    handles further decomposition and sequential execution internally.
-    Parallelism comes from multiple coarse nodes running simultaneously.
+    Core loop (spec §2):
+      1. Find ready nodes (all deps done, status pending)
+      2. Assign to free slots
+      3. Wait for completions or expansions
+      4. On completion: mark done, free slot
+      5. On expansion: merge sub-DAG into global DAG, free slot,
+         sub-nodes become schedulable
+      6. Repeat until all nodes done/failed
     """
 
     def __init__(
@@ -89,11 +92,15 @@ class DAGScheduler:
         self._worker_threads: Dict[str, threading.Thread] = {}
         self._bedrock_clients: Dict[str, Any] = {}
         self._start_time: Optional[float] = None
-        self._completion_event = threading.Event()
+        self._event = threading.Event()
 
     def get_all_bedrock_clients(self) -> Dict[str, Any]:
         with self._lock:
             return dict(self._bedrock_clients)
+
+    # ------------------------------------------------------------------
+    # DAG queries (lock must be held by caller or acquired internally)
+    # ------------------------------------------------------------------
 
     def _find_ready_nodes(self) -> List[DAGNode]:
         ready = []
@@ -117,19 +124,6 @@ class DAGScheduler:
                 for n in self.dag.nodes.values()
             )
 
-    def _check_timeouts(self):
-        now = time.time()
-        with self._lock:
-            for node in self.dag.nodes.values():
-                if node.status != "running":
-                    continue
-                if node.start_time and (now - node.start_time) > node.timeout_seconds:
-                    logger.warning(
-                        "Node %s timed out (%.0fs > %.0fs)",
-                        node.id, now - node.start_time, node.timeout_seconds,
-                    )
-                    self._handle_failure_locked(node, "timeout")
-
     def _gather_dependency_results(self, node: DAGNode) -> Dict[str, Any]:
         results = {}
         with self._lock:
@@ -139,8 +133,12 @@ class DAGScheduler:
                     results[dep_id] = dep.result
         return results
 
+    # ------------------------------------------------------------------
+    # Node assignment
+    # ------------------------------------------------------------------
+
     def _assign_node(self, node: DAGNode) -> bool:
-        """Assign a coarse node to a free display and start a worker thread."""
+        """Assign a node to a free display slot and start a worker."""
         display_num = self.display_pool.allocate(agent_id=f"worker_{node.id}")
         if display_num is None:
             return False
@@ -160,7 +158,6 @@ class DAGScheduler:
             node.agent_id = f"worker_{node.id}"
             node.start_time = time.time()
 
-        import os
         worker_output = os.path.join(self.output_dir, node.agent_id)
         os.makedirs(worker_output, exist_ok=True)
 
@@ -172,7 +169,7 @@ class DAGScheduler:
 
         thread = threading.Thread(
             target=self._run_worker_thread,
-            args=(node, display_num, bedrock, worker_output, dep_results),
+            args=(node, bedrock, worker_output, dep_results),
             daemon=True,
             name=f"worker-{node.id}",
         )
@@ -189,7 +186,6 @@ class DAGScheduler:
     def _run_worker_thread(
         self,
         node: DAGNode,
-        display_num: int,
         bedrock: Any,
         worker_output: str,
         dep_results: Dict[str, Any],
@@ -198,6 +194,7 @@ class DAGScheduler:
             from dag_worker import run_dag_worker
             result = run_dag_worker(
                 node=node,
+                scheduler=self,
                 vm_ip=self.vm_ip,
                 server_port=self.server_port,
                 bedrock=bedrock,
@@ -205,31 +202,33 @@ class DAGScheduler:
                 output_dir=worker_output,
                 password=self.password,
                 dependency_results=dep_results,
-                max_depth=self.dag.max_depth,
             )
-            self._report_completion(node.id, result)
+            # Worker returns None if it expanded (already handled via report_expansion)
+            if result is not None:
+                if result.get("status") == "DONE":
+                    self._report_completion(node.id, result)
+                else:
+                    self._report_failure(node.id, result.get("summary", "unknown"))
         except Exception as e:
             logger.error("Worker for node %s crashed: %s", node.id, e, exc_info=True)
             self._report_failure(node.id, str(e))
+
+    # ------------------------------------------------------------------
+    # Worker callbacks
+    # ------------------------------------------------------------------
 
     def _report_completion(self, node_id: str, result: Dict[str, Any]):
         with self._lock:
             node = self.dag.nodes.get(node_id)
             if not node or node.status in ("done", "failed"):
                 return
-
-            if result.get("status") == "DONE":
-                node.status = "done"
-                node.result = result
-                duration = time.time() - (node.start_time or time.time())
-                logger.info("Node %s completed (%.1fs)", node_id, duration)
-            else:
-                self._handle_failure_locked(node, result.get("summary", "unknown"))
-
+            node.status = "done"
+            node.result = result
+            duration = time.time() - (node.start_time or time.time())
+            logger.info("Node %s completed (%.1fs, depth=%d)", node_id, duration, node.depth)
             if node.display_num is not None and node.display_num > 0:
                 self.display_pool.release(node.display_num)
-
-        self._completion_event.set()
+        self._event.set()
 
     def _report_failure(self, node_id: str, error: str):
         with self._lock:
@@ -239,7 +238,100 @@ class DAGScheduler:
             self._handle_failure_locked(node, error)
             if node.display_num is not None and node.display_num > 0:
                 self.display_pool.release(node.display_num)
-        self._completion_event.set()
+        self._event.set()
+
+    def report_expansion(self, node_id: str, sub_dag_plan: List[Dict[str, Any]]):
+        """Called by a worker to expand a node into a sub-DAG.
+
+        The node is removed from the global DAG and replaced by sub-nodes.
+        The worker's slot is freed. Sub-nodes become pending and will be
+        scheduled to (potentially different) slots by the main loop.
+
+        This is spec §3 (worker decompose path) + §4 (DAG expansion).
+        """
+        with self._lock:
+            node = self.dag.nodes.get(node_id)
+            if not node:
+                return
+            logger.info(
+                "Node %s expanding into %d sub-nodes (depth %d→%d)",
+                node_id, len(sub_dag_plan), node.depth, node.depth + 1,
+            )
+            if node.display_num is not None and node.display_num > 0:
+                self.display_pool.release(node.display_num)
+            self._expand_node(node, sub_dag_plan)
+        self._event.set()
+
+    # ------------------------------------------------------------------
+    # DAG expansion (spec §4)
+    # ------------------------------------------------------------------
+
+    def _expand_node(self, node: DAGNode, sub_dag_plan: List[Dict[str, Any]]):
+        """Replace a node with its sub-DAG in the global DAG.
+
+        1. Create sub-nodes with namespaced IDs
+        2. Entry sub-nodes (no internal deps) inherit original's external deps
+        3. Find terminal sub-nodes (nothing in sub-DAG depends on them)
+        4. Rewire: anything that depended on original now depends on terminals
+        5. Remove original node
+
+        Must be called with self._lock held.
+        """
+        sub_nodes = []
+        for step in sub_dag_plan:
+            sub_id = f"{node.id}__{step['id']}"
+            internal_deps = [f"{node.id}__{d}" for d in step.get("depends_on", [])]
+            sub_node = DAGNode(
+                id=sub_id,
+                task_description=step["task"],
+                depends_on=internal_deps,
+                status="pending",
+                parent_node_id=node.id,
+                depth=node.depth + 1,
+                setup_config=step.get("setup", []),
+                max_steps=step.get("max_steps", node.max_steps),
+                timeout_seconds=node.timeout_seconds,
+                max_retries=node.max_retries,
+            )
+            sub_nodes.append(sub_node)
+
+        all_sub_ids = {sn.id for sn in sub_nodes}
+
+        # Entry nodes: sub-nodes with no internal dependencies
+        # They inherit the original node's external dependencies
+        for sn in sub_nodes:
+            has_internal_deps = any(d in all_sub_ids for d in sn.depends_on)
+            if not has_internal_deps:
+                sn.depends_on = list(node.depends_on)
+
+        # Terminal nodes: sub-nodes that no other sub-node depends on
+        depended_on_internally = set()
+        for sn in sub_nodes:
+            depended_on_internally.update(d for d in sn.depends_on if d in all_sub_ids)
+        terminal_ids = list(all_sub_ids - depended_on_internally)
+
+        # Rewire downstream: anything depending on original now depends on terminals
+        for other in self.dag.nodes.values():
+            if node.id in other.depends_on:
+                other.depends_on.remove(node.id)
+                other.depends_on.extend(terminal_ids)
+
+        # Add sub-nodes, remove original
+        for sn in sub_nodes:
+            self.dag.nodes[sn.id] = sn
+        del self.dag.nodes[node.id]
+
+        logger.info(
+            "Expanded %s → %d sub-nodes (entries: %s, terminals: %s)",
+            node.id,
+            len(sub_nodes),
+            [sn.id for sn in sub_nodes if not any(d in all_sub_ids for d in sn.depends_on)],
+            terminal_ids,
+        )
+
+    # ------------------------------------------------------------------
+    # Failure handling
+    # ------------------------------------------------------------------
 
     def _handle_failure_locked(self, node: DAGNode, error: str):
         """Must be called with self._lock held."""
@@ -252,7 +344,7 @@ class DAGScheduler:
             node.agent_id = None
             node.start_time = None
             logger.info(
-                "Node %s failed (%s), retrying (attempt %d/%d)",
+                "Node %s failed (%s), retrying (%d/%d)",
                 node.id, error[:200], node.retry_count, node.max_retries,
             )
             return
@@ -263,8 +355,22 @@ class DAGScheduler:
 
         for other in self.dag.nodes.values():
             if node.id in other.depends_on and other.status == "pending":
-                logger.warning("Cascading failure to downstream node %s", other.id)
+                logger.warning("Cascading failure to node %s", other.id)
                 self._handle_failure_locked(other, "cascade")
+
+    def _check_timeouts(self):
+        now = time.time()
+        with self._lock:
+            for node in self.dag.nodes.values():
+                if node.status != "running":
+                    continue
+                if node.start_time and (now - node.start_time) > node.timeout_seconds:
+                    logger.warning("Node %s timed out", node.id)
+                    self._handle_failure_locked(node, "timeout")
+
+    # ------------------------------------------------------------------
+    # Main scheduler loop (spec §2)
+    # ------------------------------------------------------------------
 
     def run(self) -> Dict[str, Any]:
         """Main scheduler loop. Blocks until DAG is complete or timeout."""
@@ -293,8 +399,8 @@ class DAGScheduler:
                     assigned_any = True
 
             if not assigned_any:
-                self._completion_event.wait(timeout=0.5)
-                self._completion_event.clear()
+                self._event.wait(timeout=0.5)
+                self._event.clear()
 
         duration = time.time() - self._start_time
 
@@ -325,7 +431,5 @@ class DAGScheduler:
     def _build_final_summary(self, node_summaries: Dict[str, Any]) -> str:
         parts = []
         for nid, info in sorted(node_summaries.items()):
-            status = info["status"]
-            summary = info.get("summary", "")
-            parts.append(f"[{nid}] {status}: {summary[:200]}")
+            parts.append(f"[{nid}] {info['status']}: {info.get('summary', '')[:200]}")
         return "\n".join(parts)
