@@ -1,4 +1,4 @@
-"""Run fork-based agent on OSWorld benchmark tasks.
+"""Run DAG-scheduled parallel agent on OSWorld benchmark tasks.
 
 Usage:
     python run_benchmark.py --task-id 0 --provider-name aws --region us-east-1 --headless
@@ -9,16 +9,15 @@ import argparse
 import json
 import logging
 import os
-import threading
 import time
-from pathlib import Path
 from typing import Any, Dict, Optional
 
 import requests
 
-from agent_runtime import AgentRuntime, AgentStatus
 from bedrock_client import BedrockClient
-from fork_agent import run_fork_agent
+from dag_core import DAGScheduler, DAGState
+from dag_planner import convert_plan_to_dag_state, plan_dag
+from display_pool import DisplayPool
 from google_workspace_oauth import (
     create_sheet_from_template_oauth,
     create_doc_from_template_oauth,
@@ -364,114 +363,6 @@ def _process_google_workspace_config(task_data: Dict[str, Any]) -> Dict[str, Any
     return task_data
 
 
-def agent_monitor_thread(
-    runtime: AgentRuntime,
-    vm_ip: str,
-    server_port: int,
-    bedrock: BedrockClient,
-    model: str,
-    max_steps: int,
-    output_dir: str,
-    region: str,
-    bedrock_clients: Dict[str, BedrockClient],
-):
-    """Monitor for new agents and spawn threads to run them."""
-    running_threads = {}
-
-    while True:
-        time.sleep(0.5)
-
-        all_agents = runtime.get_all_agents()
-
-        for agent_id, status_dict in all_agents.items():
-            status = status_dict["status"]
-
-            if agent_id in running_threads:
-                continue
-            if status in ("completed", "failed", "killed"):
-                continue
-            if status != "running":
-                continue
-
-            logger.info(f"[Monitor] Spawning thread for {agent_id}")
-
-            agent_output = os.path.join(output_dir, agent_id)
-            os.makedirs(agent_output, exist_ok=True)
-
-            agent_info = runtime.get_agent_status(agent_id)
-            task = agent_info.get("subtask", "")
-            context_summary = agent_info.get("context_summary")
-
-            # Create dedicated bedrock client for this agent with its own log dir
-            agent_bedrock = BedrockClient(
-                region=region,
-                log_dir=agent_output,
-                agent_id=agent_id
-            )
-            bedrock_clients[agent_id] = agent_bedrock  # Track for token aggregation
-
-            thread = threading.Thread(
-                target=run_agent_thread,
-                args=(
-                    agent_id,
-                    runtime,
-                    vm_ip,
-                    server_port,
-                    agent_bedrock,  # Use agent-specific client
-                    model,
-                    max_steps,
-                    task,
-                    context_summary,
-                    agent_output,
-                ),
-                daemon=True,
-            )
-            thread.start()
-            running_threads[agent_id] = thread
-
-        completed = [
-            aid for aid, thread in running_threads.items()
-            if not thread.is_alive()
-        ]
-        for aid in completed:
-            del running_threads[aid]
-
-        root_status = runtime.get_agent_status("root")
-        if root_status and root_status["status"] in ("completed", "failed"):
-            break
-
-
-def run_agent_thread(
-    agent_id: str,
-    runtime: AgentRuntime,
-    vm_ip: str,
-    server_port: int,
-    bedrock: BedrockClient,
-    model: str,
-    max_steps: int,
-    task: str,
-    parent_context: Optional[str],
-    output_dir: str,
-):
-    """Run an agent in a thread."""
-    try:
-        result = run_fork_agent(
-            agent_id=agent_id,
-            runtime=runtime,
-            vm_ip=vm_ip,
-            server_port=server_port,
-            bedrock=bedrock,
-            model=model,
-            task=task,
-            parent_context=parent_context,
-            max_steps=max_steps,
-            temperature=0.7,
-            output_dir=output_dir,
-        )
-        logger.info(f"[{agent_id}] Finished: {result['status']}")
-    except Exception as e:
-        logger.error(f"[{agent_id}] Crashed: {e}", exc_info=True)
-        runtime.fail_agent(agent_id, error=str(e))
 
 
 def load_osworld_tasks(task_type="standard", test_file=None):
@@ -562,13 +453,11 @@ def load_collaborative_tasks():
 
 
 def run_single_task(task_data, args, output_base):
-    """Run a single benchmark task."""
-    # Process Google Workspace configs BEFORE booting VM
+    """Run a single benchmark task using DAG scheduler."""
     task_data = _process_google_workspace_config(task_data)
 
     task_id = task_data.get("id", "unknown")
     instruction = task_data.get("instruction", "")
-    config = task_data.get("config", [])
 
     logger.info("\n" + "=" * 80)
     logger.info(f"Task {task_id}: {instruction[:100]}")
@@ -577,7 +466,6 @@ def run_single_task(task_data, args, output_base):
     output_dir = os.path.join(output_base, f"task_{task_id}")
     os.makedirs(output_dir, exist_ok=True)
 
-    # Boot VM
     from desktop_env.desktop_env import DesktopEnv
     from desktop_env.providers.aws.manager import IMAGE_ID_MAP
 
@@ -613,7 +501,6 @@ def run_single_task(task_data, args, output_base):
             logger.error(f"vm_exec failed: {e}")
         return None
 
-    # Wait for VM
     logger.info("Waiting for VM...")
     for _ in range(30):
         try:
@@ -624,82 +511,80 @@ def run_single_task(task_data, args, output_base):
             )
             if r.status_code == 200:
                 break
-        except:
+        except Exception:
             pass
         time.sleep(2)
 
-    # Initialize runtime
-    runtime = AgentRuntime(vm_exec=vm_exec, num_displays=8, password="osworld-public-evaluation")
-    runtime.initialize()
-
-    # Initialize Bedrock - shared dict to track all agent clients
-    bedrock = BedrockClient(region=args.region, log_dir=output_dir, agent_id="root")
-    bedrock_clients = {"root": bedrock}  # Track all bedrock clients for token aggregation
-
-    # Setup already ran via env.reset(task_config=task_data) above
-    # No need to execute config again
-
-    # Spawn root agent
-    root_id = runtime.spawn_root_agent(task=instruction, display_num=0)
-
-    # Start monitor
-    monitor = threading.Thread(
-        target=agent_monitor_thread,
-        args=(runtime, vm_ip, port, bedrock, args.model, args.max_steps, output_dir, args.region, bedrock_clients),
-        daemon=True,
+    display_pool = DisplayPool(
+        vm_exec=vm_exec,
+        num_displays=8,
+        password="osworld-public-evaluation",
     )
-    monitor.start()
+    display_pool.initialize()
 
-    # Wait for completion
-    start_time = time.time()
-    while True:
-        time.sleep(2)
-        root_status = runtime.get_agent_status(root_id)
-        if not root_status:
-            break
-        if root_status["status"] in ("completed", "failed", "killed"):
-            break
+    planner_bedrock = BedrockClient(
+        region=args.region, log_dir=output_dir, agent_id="planner"
+    )
 
-        # Timeout after 20 minutes
-        if time.time() - start_time > 1200:
-            logger.warning("Task timeout (20 min)")
-            runtime.fail_agent(root_id, error="Timeout")
-            break
+    logger.info("Planning DAG for task...")
+    dag_plan = plan_dag(
+        task_description=instruction,
+        bedrock=planner_bedrock,
+        model=args.model,
+    )
 
-    time.sleep(2)
+    dag_state = convert_plan_to_dag_state(
+        plan=dag_plan,
+        root_task=instruction,
+        max_depth=getattr(args, "max_depth", 2),
+    )
 
-    # Collect results
-    all_agents = runtime.get_all_agents()
-    root_info = runtime.get_agent_status(root_id)
+    with open(os.path.join(output_dir, "dag_plan.json"), "w") as f:
+        plan_data = {
+            "task_id": task_id,
+            "instruction": instruction,
+            "plan": dag_plan,
+            "num_nodes": len(dag_state.nodes),
+        }
+        json.dump(plan_data, f, indent=2)
 
-    # Aggregate token usage from all agents
-    aggregated_token_usage = aggregate_token_usage(bedrock_clients)
+    def bedrock_factory(log_dir: str, agent_id: str) -> BedrockClient:
+        return BedrockClient(region=args.region, log_dir=log_dir, agent_id=agent_id)
+
+    scheduler = DAGScheduler(
+        dag_state=dag_state,
+        display_pool=display_pool,
+        vm_exec=vm_exec,
+        bedrock_factory=bedrock_factory,
+        model=args.model,
+        vm_ip=vm_ip,
+        server_port=port,
+        output_dir=output_dir,
+        task_timeout=1200.0,
+        password="osworld-public-evaluation",
+    )
+
+    scheduler_result = scheduler.run()
+
+    all_bedrock_clients = scheduler.get_all_bedrock_clients()
+    all_bedrock_clients["planner"] = planner_bedrock
+    aggregated_token_usage = aggregate_token_usage(all_bedrock_clients)
 
     result = {
         "task_id": task_id,
         "instruction": instruction,
-        "status": root_info.get("status", "unknown") if root_info else "error",
-        "num_agents": len(all_agents),
-        "forked": len(all_agents) > 1,
-        "duration": root_info.get("duration", 0) if root_info else 0,
-        "steps": root_info.get("result", {}).get("steps_used", 0) if root_info else 0,
+        "status": scheduler_result.get("status", "unknown"),
+        "num_agents": len(all_bedrock_clients),
+        "duration": scheduler_result.get("duration", 0),
+        "dag_nodes": scheduler_result.get("nodes", {}),
         "token_usage": aggregated_token_usage,
-        "agents": {
-            agent_id: {
-                "status": info["status"],
-                "display": info["display_num"],
-            }
-            for agent_id, info in all_agents.items()
-        }
     }
 
-    # Write token_usage.json (separate file for backward compatibility)
     with open(os.path.join(output_dir, "token_usage.json"), "w") as f:
         json.dump(aggregated_token_usage, f, indent=2)
 
-    # Evaluate task completion if evaluator is configured
     score = None
-    if hasattr(env, 'evaluator') and env.evaluator:
+    if hasattr(env, "evaluator") and env.evaluator:
         logger.info("Waiting 20s before evaluation...")
         time.sleep(20)
         score = env.evaluate()
@@ -707,8 +592,7 @@ def run_single_task(task_data, args, output_base):
 
         result["score"] = score
 
-        # Save evaluation details if available
-        if hasattr(env, 'last_eval_details') and env.last_eval_details:
+        if hasattr(env, "last_eval_details") and env.last_eval_details:
             result["eval_details"] = env.last_eval_details
             with open(os.path.join(output_dir, "eval_details.json"), "w") as f:
                 json.dump(env.last_eval_details, f, indent=2)
@@ -718,15 +602,13 @@ def run_single_task(task_data, args, output_base):
     else:
         logger.info("No evaluator configured - skipping evaluation")
 
-    # Save result
     with open(os.path.join(output_dir, "result.json"), "w") as f:
         json.dump(result, f, indent=2)
 
-    # Cleanup
-    runtime.shutdown()
+    display_pool.cleanup()
 
     logger.info(f"\nTask {task_id} completed: {result['status']}")
-    logger.info(f"  Forked: {result['forked']} ({result['num_agents']} agents)")
+    logger.info(f"  Agents: {result['num_agents']}")
     logger.info(f"  Duration: {result['duration']:.1f}s")
     logger.info(f"  Cost: ${result['token_usage']['total_cost_usd']:.4f}")
     if score is not None:
@@ -754,6 +636,7 @@ def main():
     parser.add_argument("--headless", action="store_true", help="Run headless")
     parser.add_argument("--model", default="claude-opus-4-6", help="Model name")
     parser.add_argument("--max-steps", type=int, default=30, help="Max steps per agent (default: 30)")
+    parser.add_argument("--max-depth", type=int, default=2, help="Max DAG decomposition depth (default: 2)")
     parser.add_argument("--output-dir", default="benchmark_results", help="Output dir")
     args = parser.parse_args()
 
@@ -812,17 +695,16 @@ def main():
     logger.info("=" * 80)
 
     total_cost = sum(r["token_usage"]["total_cost_usd"] for r in results)
-    num_forked = sum(1 for r in results if r["forked"])
+    num_completed = sum(1 for r in results if r.get("status") == "DONE")
 
     logger.info(f"Tasks run: {len(results)}")
-    logger.info(f"Tasks that forked: {num_forked}/{len(results)} ({100*num_forked/len(results):.1f}%)")
+    logger.info(f"Tasks completed: {num_completed}/{len(results)}")
     logger.info(f"Total cost: ${total_cost:.4f}")
     logger.info(f"Avg cost per task: ${total_cost/len(results):.4f}")
 
-    # Save summary
     summary = {
         "num_tasks": len(results),
-        "num_forked": num_forked,
+        "num_completed": num_completed,
         "total_cost": total_cost,
         "results": results,
     }
