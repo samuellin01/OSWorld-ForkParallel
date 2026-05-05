@@ -1,19 +1,18 @@
 """Worker execution for DAG scheduler nodes (spec §3).
 
-Each worker is assigned a node and a display slot. Before executing, it
-decides: decompose further or execute directly.
+Each worker gets a node + display slot. It decides decompose or execute:
 
-  - DECOMPOSE: produce a sub-DAG via the planner, report it back to the
-    scheduler (which merges it into the global DAG and frees this slot).
-    The sub-nodes will be scheduled to (potentially different) slots.
+  DECOMPOSE: produce sub-DAG via planner, report to scheduler (which merges
+  it into the global DAG). Sub-nodes may run on this display (if sequential)
+  or on new displays (if parallel). The worker returns None.
 
-  - EXECUTE: run a CUA agent loop on this display to complete the task.
-    This is the leaf-level execution — the agent sees screenshots and
-    issues computer-use actions until the subtask is done.
+  EXECUTE: run a CUA agent loop on this display. The agent sees screenshots
+  and issues computer-use actions until the subtask is done. This is the
+  leaf-level executor. The worker returns the result dict.
 
-The decompose-or-execute decision follows the spec's "atomic detection":
-ask the LLM if this task can be done directly, or needs to be broken up.
-Nodes at max_depth always execute directly.
+Chain-aware: if this node is a chain continuation (chain_position > 0),
+the display state carries over from the previous step. No setup is run,
+and the system prompt tells the agent about display continuity.
 """
 
 from __future__ import annotations
@@ -48,16 +47,14 @@ def run_dag_worker(
     password: str = "osworld-public-evaluation",
     dependency_results: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Execute a single DAG node on its assigned slot.
-
-    Returns the result dict if executed directly, or None if expanded
-    (expansion is reported to the scheduler directly).
-    """
+    """Execute a DAG node. Returns result dict, or None if expanded."""
     tag = f"[{node.id}]"
     max_depth = scheduler.dag.max_depth
-    logger.info("%s Starting (depth=%d/%d, display=:%s)", tag, node.depth, max_depth, node.display_num)
+    logger.info("%s Starting (depth=%d/%d, display=:%s, chain=%s pos=%d)",
+                tag, node.depth, max_depth, node.display_num,
+                node.chain_id or "none", node.chain_position)
 
-    # Decide: decompose or execute (spec §3 step 1)
+    # Decompose-or-execute decision (spec §3 step 1)
     if node.depth < max_depth:
         from dag_planner import should_decompose
         context = _format_dep_results(dependency_results)
@@ -69,7 +66,6 @@ def run_dag_worker(
             context=context,
             max_steps=node.max_steps,
         ):
-            # Decompose path (spec §3 step 2a)
             logger.info("%s Decomposing (depth %d < max %d)", tag, node.depth, max_depth)
             from dag_planner import plan_dag
             sub_plan = plan_dag(
@@ -78,13 +74,11 @@ def run_dag_worker(
                 model=model,
                 context=context,
             )
-            # Report expansion back to scheduler — it handles merging
-            # into the global DAG and freeing this slot (spec §4)
             scheduler.report_expansion(node.id, sub_plan)
-            return None  # Signal that we expanded, not executed
+            return None
 
-    # Execute path (spec §3 step 2b) — run CUA agent on this display
-    logger.info("%s Executing directly (CUA agent loop)", tag)
+    # Execute directly — CUA agent loop
+    logger.info("%s Executing directly", tag)
     return _run_cua_agent(
         node=node,
         vm_ip=vm_ip,
@@ -123,24 +117,33 @@ def _build_worker_system_prompt(
         f"--user-data-dir=/tmp/chrome_display_{node.display_num or 0} --no-first-run "
         f"--no-default-browser-check --disable-default-apps URL "
         "\n\n"
-        "You are a worker agent assigned a specific subtask. Your display has been prepared "
-        "with the necessary applications. Focus on completing your subtask efficiently.\n"
-        "\n"
+    )
+
+    if node.chain_position > 0:
+        prompt += (
+            "**DISPLAY CONTINUITY**: Your display has been carried over from the previous "
+            "step in a sequential workflow. The screen shows exactly what the previous agent "
+            "left. Do NOT re-launch applications — they are already open. Review the current "
+            "screen state and continue from where the previous step left off.\n\n"
+        )
+    else:
+        prompt += (
+            "You are a worker agent assigned a specific subtask. Your display has been "
+            "prepared with the necessary applications.\n\n"
+        )
+
+    prompt += (
+        "Focus on completing your subtask efficiently.\n"
         "When done, output SUBTASK COMPLETE followed by a summary of what you accomplished "
-        "and any key results (data values, findings, etc.) that downstream tasks may need.\n"
+        "and any key results (data, values, findings) that downstream tasks may need.\n"
         "If you cannot complete the task, output SUBTASK FAILED with explanation.\n"
         "\n"
         "**If setup failed** - If your first screenshot shows an empty desktop or wrong app:\n"
-        "Do NOT try to fix it yourself. Immediately report:\n"
         "SUBTASK FAILED: Setup did not work. Display shows [describe what you see].\n"
         "\n"
-        "Google Docs/Sheets/Slides are collaborative real-time editing environments. "
-        "Multiple agents can open the same URL simultaneously and see each other's changes.\n"
-        "\n"
-        "Google Workspace: Do NOT use Apps Script - complete tasks through the UI directly.\n"
-        "\n"
-        "Google Sheets: Arrow keys work for navigation. Use the Name Box (top-left) to jump to cells. "
-        "Batch actions together with Tab/Enter navigation.\n"
+        "Google Docs/Sheets/Slides: multiple agents can open the same URL simultaneously.\n"
+        "Google Workspace: Do NOT use Apps Script — complete tasks through the UI.\n"
+        "Google Sheets: Use the Name Box (top-left) to jump to cells. Batch with Tab/Enter.\n"
         "\n"
     )
 
@@ -149,7 +152,7 @@ def _build_worker_system_prompt(
         for dep_id, result in dependency_results.items():
             summary = result.get("summary", str(result))[:500]
             prompt += f"  [{dep_id}]: {summary}\n"
-        prompt += "\nUse these results to inform your work. Do NOT redo completed steps.\n\n"
+        prompt += "\nUse these results. Do NOT redo completed steps.\n\n"
 
     prompt += (
         "Before outputting SUBTASK COMPLETE, verify you've actually completed the subtask.\n"
@@ -168,7 +171,7 @@ def _run_cua_agent(
     password: str,
     dependency_results: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """Run a CUA agent loop on the assigned display until subtask is done."""
+    """CUA agent loop: screenshot -> LLM -> action -> repeat."""
     tag = f"[{node.id}]"
     display_num = node.display_num or 0
     display = XvfbDisplay(vm_ip, server_port, display_num)
@@ -176,7 +179,14 @@ def _run_cua_agent(
     tools = [COMPUTER_USE_TOOL]
     resize_factor = (1920.0 / 1280.0, 1080.0 / 720.0)
 
-    initial_text = f"Your subtask:\n{node.task_description}"
+    if node.chain_position > 0:
+        initial_text = (
+            f"Your subtask (continuing on the same display from the previous step):\n"
+            f"{node.task_description}"
+        )
+    else:
+        initial_text = f"Your subtask:\n{node.task_description}"
+
     messages: List[Dict[str, Any]] = [
         {"role": "user", "content": [{"type": "text", "text": initial_text}]}
     ]
@@ -242,8 +252,7 @@ def _run_cua_agent(
                 logger.error("%s Conversation corruption at step %d", tag, step)
                 return {
                     "status": "ERROR",
-                    "error_type": "tool_result_missing",
-                    "summary": f"Conversation history corruption: {error_msg}",
+                    "summary": f"Conversation corruption: {error_msg}",
                     "steps_used": step,
                     "duration": time.time() - start_time,
                 }
@@ -290,8 +299,7 @@ def _run_cua_agent(
                         elif action_type == "key":
                             f.write(f"Key: {tool_input.get('text', '')}")
                         elif action_type in ("left_click", "right_click", "double_click", "middle_click"):
-                            coord = tool_input.get("coordinate", [])
-                            f.write(f"{action_type.replace('_', ' ').title()} at {coord}")
+                            f.write(f"{action_type.replace('_', ' ').title()} at {tool_input.get('coordinate', [])}")
                         elif action_type == "mouse_move":
                             f.write(f"Move to {tool_input.get('coordinate', [])}")
                         elif action_type == "screenshot":
@@ -299,19 +307,16 @@ def _run_cua_agent(
                         else:
                             f.write(f"Computer: {action_type}")
 
-        lines = final_response_text.strip().split("\n")
-        for line in lines:
+        for line in final_response_text.strip().split("\n"):
             line = line.strip()
             if re.search(r'\bSUBTASK\s+COMPLETE\b', line, re.IGNORECASE):
                 logger.info("%s SUBTASK COMPLETE at step %d", tag, step)
-                completion_time = time.time()
                 return {
                     "status": "DONE",
                     "summary": final_response_text,
                     "steps_used": step,
-                    "duration": completion_time - start_time,
+                    "duration": time.time() - start_time,
                 }
-
             if re.search(r'\bSUBTASK\s+FAILED\b', line, re.IGNORECASE):
                 logger.info("%s SUBTASK FAILED at step %d", tag, step)
                 return {
