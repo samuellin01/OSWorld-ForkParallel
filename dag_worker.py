@@ -1,8 +1,12 @@
 """Worker execution for DAG scheduler nodes.
 
-Each worker runs a single DAGNode on an assigned display. It first decides
-whether to decompose the node further (expand into sub-DAG) or execute it
-atomically using a CUA agent loop.
+Each worker owns one display. It receives a coarse subtask and either:
+1. Runs a CUA agent loop directly (screenshot → LLM → action → repeat)
+2. Decomposes the subtask into a fine-grained action plan, then executes
+   each action sequentially on its display
+
+Both paths use the same display — sub-actions don't get separate displays.
+Parallelism comes from multiple workers on different displays.
 """
 
 from __future__ import annotations
@@ -17,7 +21,7 @@ from typing import Any, Dict, List, Optional
 import anthropic
 
 from agent_utils import COMPUTER_USE_TOOL, _resize_screenshot, parse_computer_use_actions
-from dag_core import DAGNode, DAGSchedulerCallback
+from dag_core import DAGNode
 from fork_agent import XvfbDisplay
 
 logger = logging.getLogger(__name__)
@@ -25,7 +29,6 @@ logger = logging.getLogger(__name__)
 
 def run_dag_worker(
     node: DAGNode,
-    scheduler_callback: DAGSchedulerCallback,
     vm_ip: str,
     server_port: int,
     bedrock: Any,
@@ -33,38 +36,31 @@ def run_dag_worker(
     output_dir: str,
     password: str = "osworld-public-evaluation",
     dependency_results: Optional[Dict[str, Any]] = None,
-    max_depth: int = 2,
+    max_depth: int = 3,
 ) -> Dict[str, Any]:
-    """Execute a single DAG node.
+    """Execute a coarse DAG node on its assigned display.
 
-    Either decomposes it into a sub-DAG (if complex) or executes it
-    atomically using a CUA agent loop.
+    The worker decides whether to:
+    - Run a CUA agent loop (for tasks requiring visual feedback / adaptation)
+    - Decompose into a fine action plan and execute sequentially (when steps are known)
+
+    In practice, most tasks benefit from the CUA agent loop since the agent
+    needs to see the screen to determine coordinates and adapt to UI state.
+    Decomposition into a fine plan is useful when the exact action sequence
+    is predictable (e.g., fill specific cells with known values).
     """
     tag = f"[{node.id}]"
     logger.info("%s Starting worker (depth=%d, display=:%s)", tag, node.depth, node.display_num)
 
-    if node.depth < max_depth and not _is_likely_atomic(node.task_description):
-        from dag_planner import should_decompose
-        context = _format_dep_results(dependency_results)
-        if should_decompose(
-            task_description=node.task_description,
-            bedrock=bedrock,
-            model=model,
-            context=context,
-            max_steps=node.max_steps,
-        ):
-            logger.info("%s Decomposing into sub-DAG", tag)
-            from dag_planner import plan_dag
-            sub_plan = plan_dag(
-                task_description=node.task_description,
-                bedrock=bedrock,
-                model=model,
-                context=context,
-            )
-            scheduler_callback.report_expansion(node.id, sub_plan)
-            return {"status": "EXPANDED", "summary": f"Expanded into {len(sub_plan)} sub-nodes"}
+    # For now, always use CUA agent loop — the agent sees the screen
+    # and decides what to do. Fine-grained action plans require knowing
+    # exact coordinates which we don't have until we see the screenshot.
+    #
+    # Future: if should_decompose() returns True AND we have a way to
+    # resolve "click the Name Box" → actual coordinates, we can use
+    # plan_fine_actions() here. For now, the CUA loop handles it.
 
-    return _execute_atomic(
+    return _run_cua_agent(
         node=node,
         vm_ip=vm_ip,
         server_port=server_port,
@@ -74,19 +70,6 @@ def run_dag_worker(
         password=password,
         dependency_results=dependency_results,
     )
-
-
-def _is_likely_atomic(task_description: str) -> bool:
-    """Quick heuristic: if the task is short and simple, skip decomposition check."""
-    simple_keywords = [
-        "click", "type", "press", "open", "navigate", "scroll",
-        "select", "check", "enable", "disable", "toggle",
-    ]
-    desc_lower = task_description.lower()
-    word_count = len(task_description.split())
-    if word_count < 15 and any(kw in desc_lower for kw in simple_keywords):
-        return True
-    return False
 
 
 def _format_dep_results(dependency_results: Optional[Dict[str, Any]]) -> str:
@@ -115,8 +98,10 @@ def _build_worker_system_prompt(
         f"--user-data-dir=/tmp/chrome_display_{node.display_num or 0} --no-first-run "
         f"--no-default-browser-check --disable-default-apps URL "
         "\n\n"
-        "You are a worker agent assigned a specific subtask. Your display has been prepared. "
-        "Focus on completing your subtask efficiently. When done, output SUBTASK COMPLETE with your result. "
+        "You are a worker agent assigned a specific subtask. Your display has been prepared "
+        "with the necessary applications. Focus on completing your subtask efficiently.\n"
+        "\n"
+        "When done, output SUBTASK COMPLETE followed by a summary of what you accomplished.\n"
         "If you cannot complete the task, output SUBTASK FAILED with explanation.\n"
         "\n"
         "**If setup failed** - If your first screenshot shows an empty desktop or wrong app:\n"
@@ -138,7 +123,7 @@ def _build_worker_system_prompt(
         for dep_id, result in dependency_results.items():
             summary = result.get("summary", str(result))[:500]
             prompt += f"  [{dep_id}]: {summary}\n"
-        prompt += "\n"
+        prompt += "\nUse these results to inform your work. Do NOT redo completed steps.\n\n"
 
     prompt += (
         "Before outputting SUBTASK COMPLETE, verify you've actually completed the subtask.\n"
@@ -147,7 +132,7 @@ def _build_worker_system_prompt(
     return prompt
 
 
-def _execute_atomic(
+def _run_cua_agent(
     node: DAGNode,
     vm_ip: str,
     server_port: int,
@@ -157,7 +142,11 @@ def _execute_atomic(
     password: str,
     dependency_results: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """Run a CUA agent loop to execute the node's task atomically."""
+    """Run a CUA agent loop: screenshot → LLM → action → repeat.
+
+    The agent sees the screen each step and decides what to do.
+    This is the standard computer-use agent pattern.
+    """
     tag = f"[{node.id}]"
     display_num = node.display_num or 0
     display = XvfbDisplay(vm_ip, server_port, display_num)
