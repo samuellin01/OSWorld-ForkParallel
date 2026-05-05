@@ -1,9 +1,12 @@
-"""LLM-based DAG planner for task decomposition.
+"""LLM-based DAG planner for hierarchical task decomposition (spec §1).
 
-Two-level planning:
-1. Coarse planner: breaks a task into parallel subtasks (each gets a display)
-2. Fine planner: breaks a subtask into sequential computer-use actions
-   (click, type, key press — executed on the same display)
+Called at two points:
+1. Once at the root to produce the initial coarse DAG
+2. By each worker before executing, to decide decompose-or-execute and
+   produce a finer sub-DAG if decomposing
+
+The planner always outputs the same format: a list of steps with dependency
+edges. The scheduler merges sub-DAGs into the global DAG (spec §4).
 """
 
 from __future__ import annotations
@@ -18,128 +21,75 @@ from dag_core import DAGNode, DAGState
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Coarse planner: task → parallel subtasks (one display each)
+# Planner prompt — used at every level of decomposition
 # ---------------------------------------------------------------------------
 
-_COARSE_PLANNER_PROMPT = """\
+_PLANNER_SYSTEM_PROMPT = """\
 You are a task decomposition planner for a multi-agent computer-use system.
 
-The system has multiple virtual displays. Each subtask you create will be \
-assigned to a separate display and executed by an independent agent IN PARALLEL. \
-Agents on different displays cannot see each other's screens.
+The system has multiple virtual displays (slots). Each subtask you create will \
+be assigned to a separate display and executed by an independent CUA agent \
+IN PARALLEL with other ready subtasks. Agents on different displays cannot \
+see each other's screens.
 
-Break the given task into subtasks that can run on separate displays simultaneously. \
-Each subtask should be a coherent unit of work that one agent can complete on its \
+Break the given task into subtasks that maximize parallelism. Each subtask \
+should be a coherent unit of work that one CUA agent can complete on its \
 own display (open apps, navigate, click, type, etc.).
 
 Output a JSON list. Each element has:
 - "id": short identifier (e.g., "step_0")
-- "task": clear description of what the agent should accomplish on its display
-- "depends_on": list of step IDs that must complete first (empty = can start immediately)
+- "task": clear, self-contained description of what the agent should accomplish. \
+Include ALL information the agent needs — it cannot see other agents' screens. \
+If the agent needs data from a prior step, say "using the result from step X" \
+and the system will inject that result.
+- "depends_on": list of step IDs that must complete first (empty = can start immediately). \
+Use this to express true data dependencies. Steps with no dependencies run in parallel.
 - "setup": list of setup actions to prepare the display BEFORE the agent starts \
-(see types below). This is critical — the agent spawns on an EMPTY display.
+(see types below). CRITICAL: agents spawn on EMPTY displays.
 - "max_steps": estimated number of computer-use actions needed (default 30)
 
-Setup types (prepare the display before the agent starts):
-- {"type": "chrome_open_tabs", "parameters": {"urls_to_open": ["https://..."]}}
-- {"type": "launch", "parameters": {"command": ["app", "arg1", ...]}}
-- {"type": "command", "parameters": {"command": "shell command string"}}
-- {"type": "download", "parameters": {"files": [{"path": "/tmp/f.csv", "url": "https://..."}]}}
-- {"type": "sleep", "parameters": {"seconds": 3}}
+Setup types:
+- {{"type": "chrome_open_tabs", "parameters": {{"urls_to_open": ["https://..."]}}}}
+- {{"type": "launch", "parameters": {{"command": ["app", "arg1", ...]}}}}
+- {{"type": "command", "parameters": {{"command": "shell command string"}}}}
+- {{"type": "sleep", "parameters": {{"seconds": 3}}}}
 
 Guidelines:
-- Google Workspace (Sheets/Docs/Slides): multiple agents CAN open the same URL \
-on different displays and edit the same document collaboratively in real-time. \
-Specify which section/cells each agent should edit to avoid conflicts.
-- Maximize parallelism: independent research, independent cells, independent files.
-- Don't over-split: adjacent cells fillable with Tab, formula-based work, or \
-tasks with fewer than 3 actions should NOT be separate steps.
+- MAXIMIZE PARALLEL WORK: if two subtasks don't need each other's output, \
+make them independent (no depends_on between them).
+- Google Workspace: multiple agents CAN open the same Google Doc/Sheet/Slides \
+URL simultaneously and edit collaboratively in real-time. Use this for parallel \
+editing — assign each agent a specific section/cells to avoid conflicts.
+- Don't over-split: tasks with < 3 actions aren't worth a separate slot.
 - If the task is simple enough for one agent, return a single step.
-- Every step MUST have setup — the display starts empty. At minimum, open Chrome \
-or launch the required application.
+- Every step MUST have setup — displays start empty.
 
-Output ONLY the JSON list, no other text. Example:
-[
-  {"id": "step_0", "task": "Research topic X and note the answer", "depends_on": [], \
-"setup": [{"type": "chrome_open_tabs", "parameters": {"urls_to_open": ["https://google.com"]}}], \
-"max_steps": 25},
-  {"id": "step_1", "task": "Research topic Y and note the answer", "depends_on": [], \
-"setup": [{"type": "chrome_open_tabs", "parameters": {"urls_to_open": ["https://google.com"]}}], \
-"max_steps": 25},
-  {"id": "step_2", "task": "Fill both answers into the spreadsheet", \
-"depends_on": ["step_0", "step_1"], \
-"setup": [{"type": "chrome_open_tabs", "parameters": {"urls_to_open": ["https://docs.google.com/spreadsheets/d/..."]}}], \
-"max_steps": 15}
-]"""
+Output ONLY the JSON list, no other text."""
 
 
 # ---------------------------------------------------------------------------
-# Fine planner: subtask → sequential computer-use actions
-# ---------------------------------------------------------------------------
-
-_FINE_PLANNER_PROMPT = """\
-You are planning the exact sequence of computer-use actions to complete a subtask.
-
-The agent is on a desktop with the environment already set up (apps open, URLs loaded). \
-Break the subtask into the individual actions the agent needs to perform, in order.
-
-Each action is one of:
-- click(x, y): left-click at screen coordinates
-- type(text): type text using keyboard
-- key(keys): press key(s), e.g., "Return", "ctrl+a", "Tab"
-- scroll(direction, amount): scroll up/down/left/right
-- wait(): pause briefly for page to load
-
-Output a JSON list of actions. Each element has:
-- "id": short identifier (e.g., "a0", "a1")
-- "action": one of "click", "type", "key", "scroll", "wait"
-- "parameters": action-specific parameters
-- "description": brief human-readable description of what this action does
-- "depends_on": list of action IDs that must complete first (usually just the previous action)
-
-You do NOT know exact coordinates yet — describe clicks by what UI element to target. \
-The executing agent will see the actual screen and determine coordinates.
-
-Example for "Type 'hello' into cell B2 of a Google Sheet":
-[
-  {"id": "a0", "action": "click", "parameters": {"target": "Name Box (top-left, showing current cell)"}, \
-"description": "Click the Name Box to select it", "depends_on": []},
-  {"id": "a1", "action": "type", "parameters": {"text": "B2"}, \
-"description": "Type cell address B2", "depends_on": ["a0"]},
-  {"id": "a2", "action": "key", "parameters": {"keys": "Return"}, \
-"description": "Press Enter to navigate to B2", "depends_on": ["a1"]},
-  {"id": "a3", "action": "type", "parameters": {"text": "hello"}, \
-"description": "Type the value", "depends_on": ["a2"]},
-  {"id": "a4", "action": "key", "parameters": {"keys": "Return"}, \
-"description": "Press Enter to confirm", "depends_on": ["a3"]}
-]
-
-Output ONLY the JSON list."""
-
-
-# ---------------------------------------------------------------------------
-# Decomposition check
+# Decomposition check (spec §1 "atomic detection")
 # ---------------------------------------------------------------------------
 
 _DECOMPOSE_CHECK_PROMPT = """\
-You are deciding whether a subtask should be further decomposed into a plan \
-of individual computer-use actions, or whether a CUA agent should handle it \
-as a single unit (the agent sees the screen and decides what to do each step).
+You are deciding whether a subtask should be further decomposed into \
+multiple parallel subtasks, or executed directly by a single CUA agent.
 
 Subtask: {task_description}
 Context from completed dependencies: {context}
 
-A CUA agent can take screenshots, reason about what it sees, and issue actions \
-(click, type, key press). It's good at multi-step UI interaction but has a \
-budget of {max_steps} actions.
+The CUA agent can take screenshots, reason about what it sees, and perform \
+actions (click, type, key press, scroll). It has a budget of {max_steps} actions.
 
 Should this subtask be:
-- Executed by a CUA agent directly (it will figure out the steps by looking at the screen)
-- Decomposed into an explicit action plan first (useful when you know the exact steps)
+- EXECUTE directly by one CUA agent (it's a coherent unit of work)
+- DECOMPOSE into multiple parallel subtasks (it contains independent parts \
+  that different agents could work on simultaneously on separate displays)
 
-Answer with ONLY one of:
-- "AGENT" — let a CUA agent handle it (it sees the screen and adapts)
-- "PLAN" — decompose into explicit actions first"""
+Only answer DECOMPOSE if there are genuinely independent sub-parts that \
+benefit from parallelism. Sequential steps on the same display don't benefit.
+
+Answer with ONLY one word: "EXECUTE" or "DECOMPOSE"."""
 
 
 def plan_dag(
@@ -149,16 +99,20 @@ def plan_dag(
     context: Optional[str] = None,
     temperature: float = 0.3,
 ) -> List[Dict[str, Any]]:
-    """Produce a coarse DAG plan: task → parallel subtasks."""
+    """Produce a DAG plan for a task via LLM.
+
+    Used both for initial root planning and for sub-DAG planning at any depth.
+    Returns a list of step dicts with id, task, depends_on, setup, max_steps.
+    """
     user_msg = f"Task: {task_description}"
     if context:
-        user_msg += f"\n\nAdditional context:\n{context}"
+        user_msg += f"\n\nContext from completed prior steps:\n{context}"
 
     messages = [{"role": "user", "content": [{"type": "text", "text": user_msg}]}]
 
     content_blocks, _ = bedrock.chat(
         messages=messages,
-        system=_COARSE_PLANNER_PROMPT,
+        system=_PLANNER_SYSTEM_PROMPT,
         model=model,
         temperature=temperature,
         max_tokens=4096,
@@ -171,7 +125,7 @@ def plan_dag(
 
     plan = _parse_plan_json(response_text)
     if not plan:
-        logger.warning("Planner returned empty/invalid plan, creating single-step fallback")
+        logger.warning("Planner returned empty/invalid plan, single-step fallback")
         plan = [{
             "id": "step_0",
             "task": task_description,
@@ -190,44 +144,6 @@ def plan_dag(
     return plan
 
 
-def plan_fine_actions(
-    task_description: str,
-    bedrock: Any,
-    model: str,
-    context: Optional[str] = None,
-    temperature: float = 0.3,
-) -> List[Dict[str, Any]]:
-    """Produce a fine action plan: subtask → sequential actions."""
-    user_msg = f"Subtask: {task_description}"
-    if context:
-        user_msg += f"\n\nContext from prior steps:\n{context}"
-
-    messages = [{"role": "user", "content": [{"type": "text", "text": user_msg}]}]
-
-    content_blocks, _ = bedrock.chat(
-        messages=messages,
-        system=_FINE_PLANNER_PROMPT,
-        model=model,
-        temperature=temperature,
-        max_tokens=4096,
-    )
-
-    response_text = "".join(
-        b.get("text", "") for b in content_blocks
-        if isinstance(b, dict) and b.get("type") == "text"
-    )
-
-    actions = _parse_plan_json(response_text)
-    if not actions:
-        logger.warning("Fine planner returned empty plan")
-        return []
-
-    logger.info("Fine action plan: %d actions", len(actions))
-    for a in actions:
-        logger.info("  %s: %s — %s", a.get("id"), a.get("action"), a.get("description", "")[:60])
-    return actions
-
-
 def should_decompose(
     task_description: str,
     bedrock: Any,
@@ -236,8 +152,8 @@ def should_decompose(
     max_steps: int = 30,
     temperature: float = 0.3,
 ) -> bool:
-    """Ask the LLM whether a subtask should be decomposed into an action plan
-    or handled directly by a CUA agent."""
+    """Ask the LLM whether a subtask should be decomposed into parallel parts
+    or executed directly by a single CUA agent (spec §1 atomic detection)."""
     prompt = _DECOMPOSE_CHECK_PROMPT.format(
         task_description=task_description,
         context=context or "(none)",
@@ -248,10 +164,10 @@ def should_decompose(
 
     content_blocks, _ = bedrock.chat(
         messages=messages,
-        system="You are a task analysis assistant. Be concise.",
+        system="You are a task analysis assistant. Answer with one word.",
         model=model,
         temperature=temperature,
-        max_tokens=50,
+        max_tokens=20,
     )
 
     response_text = "".join(
@@ -259,7 +175,9 @@ def should_decompose(
         if isinstance(b, dict) and b.get("type") == "text"
     ).strip().upper()
 
-    return "PLAN" in response_text
+    result = "DECOMPOSE" in response_text
+    logger.info("Decompose check: %s → %s", task_description[:60], "DECOMPOSE" if result else "EXECUTE")
+    return result
 
 
 def convert_plan_to_dag_state(
@@ -267,7 +185,7 @@ def convert_plan_to_dag_state(
     root_task: str,
     max_depth: int = 3,
 ) -> DAGState:
-    """Convert a coarse planner output into a DAGState."""
+    """Convert a planner output into a DAGState."""
     nodes = {}
     for step in plan:
         node_id = step["id"]
@@ -319,17 +237,12 @@ def _validate_plan(plan: List[Dict[str, Any]]):
     for step in plan:
         if "id" not in step:
             step["id"] = f"step_{plan.index(step)}"
-
         if "task" not in step:
             step["task"] = "Unknown task"
-
         if "depends_on" not in step:
             step["depends_on"] = []
-
         step["depends_on"] = [d for d in step["depends_on"] if d in ids and d != step["id"]]
-
         if "setup" not in step:
             step["setup"] = []
-
         if "max_steps" not in step:
             step["max_steps"] = 30
