@@ -519,6 +519,7 @@ def run_single_task(task_data, args, output_base):
         vm_exec=vm_exec,
         num_displays=8,
         password="osworld-public-evaluation",
+        include_primary=True,
     )
     display_pool.initialize()
 
