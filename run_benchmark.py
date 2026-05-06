@@ -15,8 +15,8 @@ from typing import Any, Dict, Optional
 import requests
 
 from bedrock_client import BedrockClient
-from dag_core import DAGScheduler, DAGState
-from dag_planner import convert_plan_to_dag_state, plan_dag
+from dag_core import Orchestrator
+from dag_planner import convert_plan_to_dag, plan_dag
 from display_pool import DisplayPool
 from google_workspace_oauth import (
     create_sheet_from_template_oauth,
@@ -533,26 +533,23 @@ def run_single_task(task_data, args, output_base):
         model=args.model,
     )
 
-    dag_state = convert_plan_to_dag_state(
-        plan=dag_plan,
-        root_task=instruction,
-        max_depth=getattr(args, "max_depth", 2),
-    )
+    dag = convert_plan_to_dag(plan=dag_plan, root_task=instruction)
 
     with open(os.path.join(output_dir, "dag_plan.json"), "w") as f:
         plan_data = {
             "task_id": task_id,
             "instruction": instruction,
             "plan": dag_plan,
-            "num_nodes": len(dag_state.nodes),
+            "num_agents": len(dag.agents),
+            "num_signals": len(dag.signals),
         }
         json.dump(plan_data, f, indent=2)
 
     def bedrock_factory(log_dir: str, agent_id: str) -> BedrockClient:
         return BedrockClient(region=args.region, log_dir=log_dir, agent_id=agent_id)
 
-    scheduler = DAGScheduler(
-        dag_state=dag_state,
+    orchestrator = Orchestrator(
+        plan=dag,
         display_pool=display_pool,
         vm_exec=vm_exec,
         bedrock_factory=bedrock_factory,
@@ -564,19 +561,19 @@ def run_single_task(task_data, args, output_base):
         password="osworld-public-evaluation",
     )
 
-    scheduler_result = scheduler.run()
+    orchestrator_result = orchestrator.run()
 
-    all_bedrock_clients = scheduler.get_all_bedrock_clients()
+    all_bedrock_clients = orchestrator.get_all_bedrock_clients()
     all_bedrock_clients["planner"] = planner_bedrock
     aggregated_token_usage = aggregate_token_usage(all_bedrock_clients)
 
     result = {
         "task_id": task_id,
         "instruction": instruction,
-        "status": scheduler_result.get("status", "unknown"),
+        "status": orchestrator_result.get("status", "unknown"),
         "num_agents": len(all_bedrock_clients),
-        "duration": scheduler_result.get("duration", 0),
-        "dag_nodes": scheduler_result.get("nodes", {}),
+        "duration": orchestrator_result.get("duration", 0),
+        "agents": orchestrator_result.get("agents", {}),
         "token_usage": aggregated_token_usage,
     }
 
@@ -636,7 +633,6 @@ def main():
     parser.add_argument("--headless", action="store_true", help="Run headless")
     parser.add_argument("--model", default="claude-opus-4-6", help="Model name")
     parser.add_argument("--max-steps", type=int, default=30, help="Max steps per agent (default: 30)")
-    parser.add_argument("--max-depth", type=int, default=2, help="Max DAG decomposition depth (default: 2)")
     parser.add_argument("--output-dir", default="benchmark_results", help="Output dir")
     args = parser.parse_args()
 
