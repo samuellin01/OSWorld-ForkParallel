@@ -131,10 +131,14 @@ _MANAGER_PROMPT = """\
 You are managing a computer-use worker agent. You watch every step it takes \
 and decide when to intervene.
 
-Overall task: {root_task}
-Your agent: {agent_id} — {agent_task}
+Overall goal (for context): {root_task}
+
+Your worker's assigned task (your scope — only spawn helpers for work within this): {agent_task}
 Current phase: {phase_task}
 Free displays available for helpers: {idle_displays}
+
+Helpers you have already spawned (do NOT duplicate):
+{helpers_already_spawned}
 
 Your previous assessment:
 {previous_assessment}
@@ -147,26 +151,32 @@ Worker's latest output:
 
 Updated totals: {total_steps} steps, {total_elapsed:.0f}s elapsed, {avg_step_time:.1f}s/step
 
-Based on the full history and new steps, update your assessment and decide:
+Update your assessment and decide on action:
 
-1. First, write your updated assessment in this format:
+1. Write your updated assessment:
 ASSESSMENT
-work_completed: <what the worker has accomplished so far>
-work_remaining: <what's left to do>
+work_completed: <what the worker has done so far>
+work_remaining: <what's left within THIS worker's task>
 estimated_remaining_steps: <number>
-pace_notes: <any observations about speed, struggles, or efficiency>
+pace_notes: <observations about speed or struggles>
 
-2. Then decide on action:
+2. Decide on action:
 
-CONTINUE — no intervention needed, worker is on track
+CONTINUE — worker is on track, no intervention needed
 
-SPAWN_HELPER — separable work exists that another agent could do in parallel
-helper_task: <specific, self-contained task for the helper>
+SPAWN_HELPER — there is separable work WITHIN THIS WORKER'S TASK that a \
+helper could do in parallel on a separate display. Only for work not already \
+covered by a spawned helper above. The helper should handle a portion of \
+THIS worker's task, not another agent's task.
+helper_task: <specific, self-contained subtask>
 helper_setup: <"none" or a JSON setup action>
-message_to_worker: <tell worker what to skip>
+message_to_worker: <tell worker what to skip since helper handles it>
 
-NUDGE — worker is going off track, taking too long, or stuck
+NUDGE — worker is stuck or going off track
 message_to_worker: <guidance or course correction>"""
+
+
+MAX_HELPERS_PER_MANAGER = 3
 
 
 class Manager:
@@ -175,6 +185,8 @@ class Manager:
     Runs in its own thread alongside the worker. Processes each new step,
     maintains a running assessment of progress, and intervenes when needed
     (spawn helpers, message worker, nudge).
+
+    Scoped to its own worker's task only — does not try to help other agents.
     """
 
     def __init__(
@@ -239,21 +251,28 @@ class Manager:
         # Format new steps with inter-step latency
         step_lines = []
         for i, rec in enumerate(new_steps):
-            if i == 0 and self._last_step_seen > len(new_steps):
-                delta = ""
-            elif i > 0:
+            if i > 0:
                 delta = f", {rec.elapsed - new_steps[i-1].elapsed:.1f}s since prev"
             else:
                 delta = ""
             step_lines.append(f"  step {rec.step_num} (+{rec.elapsed:.0f}s{delta}): {rec.action_summary}")
         new_steps_text = "\n".join(step_lines) if step_lines else "(none)"
 
+        # Format already-spawned helpers so the LLM doesn't repeat
+        if self._helpers_spawned:
+            helpers_text = "\n".join(f"  - {h}" for h in self._helpers_spawned)
+        else:
+            helpers_text = "(none)"
+
+        # If at max helpers, don't show idle displays to avoid tempting the LLM
+        effective_idle = idle_displays if len(self._helpers_spawned) < MAX_HELPERS_PER_MANAGER else 0
+
         prompt = _MANAGER_PROMPT.format(
             root_task=self.orchestrator.plan.root_task[:500],
-            agent_id=self.agent.id,
             agent_task=self.agent.task[:300],
             phase_task=phase.task[:300],
-            idle_displays=idle_displays,
+            idle_displays=effective_idle,
+            helpers_already_spawned=helpers_text,
             previous_assessment=self._assessment,
             new_steps=new_steps_text,
             latest_response=phase.latest_response[:2000],
@@ -304,34 +323,37 @@ class Manager:
                 self._assessment = "\n".join(assessment_lines)
 
         if "SPAWN_HELPER" in response:
-            helper_task = ""
-            helper_setup: List[Dict[str, Any]] = []
-            message = ""
-
-            for line in response.split("\n"):
-                line = line.strip()
-                if line.startswith("helper_task:"):
-                    helper_task = line[len("helper_task:"):].strip()
-                elif line.startswith("helper_setup:"):
-                    setup_str = line[len("helper_setup:"):].strip()
-                    if setup_str.lower() != "none":
-                        try:
-                            parsed = json.loads(setup_str)
-                            helper_setup = [parsed] if isinstance(parsed, dict) else parsed
-                        except json.JSONDecodeError:
-                            pass
-                elif line.startswith("message_to_worker:"):
-                    message = line[len("message_to_worker:"):].strip()
-
-            if helper_task:
-                logger.info("%s SPAWN_HELPER: %s", tag, helper_task[:100])
-                helper_id = self.orchestrator.spawn_helper(helper_task, helper_setup)
-                if helper_id:
-                    self._helpers_spawned.append(helper_id)
-                if message:
-                    self.orchestrator.send_message(self.agent.id, message)
+            if len(self._helpers_spawned) >= MAX_HELPERS_PER_MANAGER:
+                logger.info("%s SPAWN_HELPER requested but at cap (%d helpers)", tag, MAX_HELPERS_PER_MANAGER)
             else:
-                logger.info("%s SPAWN_HELPER but no task parsed", tag)
+                helper_task = ""
+                helper_setup: List[Dict[str, Any]] = []
+                message = ""
+
+                for line in response.split("\n"):
+                    line = line.strip()
+                    if line.startswith("helper_task:"):
+                        helper_task = line[len("helper_task:"):].strip()
+                    elif line.startswith("helper_setup:"):
+                        setup_str = line[len("helper_setup:"):].strip()
+                        if setup_str.lower() != "none":
+                            try:
+                                parsed = json.loads(setup_str)
+                                helper_setup = [parsed] if isinstance(parsed, dict) else parsed
+                            except json.JSONDecodeError:
+                                pass
+                    elif line.startswith("message_to_worker:"):
+                        message = line[len("message_to_worker:"):].strip()
+
+                if helper_task:
+                    logger.info("%s SPAWN_HELPER: %s", tag, helper_task[:100])
+                    helper_id = self.orchestrator.spawn_helper(helper_task, helper_setup)
+                    if helper_id:
+                        self._helpers_spawned.append(f"{helper_id}: {helper_task[:80]}")
+                    if message:
+                        self.orchestrator.send_message(self.agent.id, message)
+                else:
+                    logger.info("%s SPAWN_HELPER but no task parsed", tag)
 
         elif "NUDGE" in response:
             message = ""
