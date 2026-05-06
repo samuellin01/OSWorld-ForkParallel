@@ -1,12 +1,18 @@
-"""Core data structures and scheduler for hierarchical DAG-based parallel execution.
+"""Core data structures and orchestrator for signal/await parallel execution.
 
 Architecture:
-  - Scheduler maintains a global merged DAG
-  - Assigns ready nodes to free slots (displays)
-  - Workers either decompose (expand node -> sub-DAG merged back) or execute
-  - Sequential sub-nodes share a display via "display chains"
-  - Parallel sub-nodes get separate displays
-  - Recursive decomposition until CUA agents handle leaf nodes
+  - Orchestrator decomposes a task into agents, each on its own display
+  - Each agent runs phases sequentially on the same display
+  - Cross-agent data flows through named signals (signal/await)
+  - All agents start immediately; they only block at await points
+  - Setup (no cross-agent deps) runs in parallel across all agents
+
+Example:
+  Agent A: [open chrome] → [search] → [extract] → signal("results")
+  Agent B: [open doc] → [navigate] → await("results") → [paste]
+
+  Agent B's first two actions run in parallel with Agent A.
+  B only blocks at the await point. Both agents start immediately.
 """
 
 from __future__ import annotations
@@ -16,7 +22,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional
 
 from display_pool import DisplayPool
 from setup_executor import SetupExecutor
@@ -25,55 +31,63 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class DAGNode:
+class Signal:
+    """A named data channel between agents."""
+    name: str
+    producer: str
+    data: Optional[Dict[str, Any]] = None
+    is_set: bool = False
+    failed: bool = False
+    error: Optional[str] = None
+
+
+@dataclass
+class Phase:
+    """A phase of work within an agent. Phases run sequentially on the same display."""
     id: str
-    task_description: str
-    depends_on: List[str] = field(default_factory=list)
-    status: str = "pending"  # pending | running | done | failed
+    task: str
+    awaits: List[str] = field(default_factory=list)
+    signals: List[str] = field(default_factory=list)
+    max_steps: int = 20
+    status: str = "pending"
     result: Optional[Dict[str, Any]] = None
-    agent_id: Optional[str] = None
-    display_num: Optional[int] = None
-    parent_node_id: Optional[str] = None
-    depth: int = 0
-    setup_config: List[Dict[str, Any]] = field(default_factory=list)
-    max_steps: int = 30
     start_time: Optional[float] = None
-    timeout_seconds: float = 600.0
-    retry_count: int = 0
-    max_retries: int = 1
-    chain_id: Optional[str] = None
-    chain_position: int = 0
-    chain_successor: Optional[str] = None
+    end_time: Optional[float] = None
 
 
 @dataclass
-class DisplayChain:
-    """A sequential chain of nodes that share one display."""
-    chain_id: str
-    node_ids: List[str]
+class AgentPlan:
+    """An agent's complete work plan: display setup + ordered phases."""
+    id: str
+    task: str
+    phases: List[Phase] = field(default_factory=list)
+    setup: List[Dict[str, Any]] = field(default_factory=list)
     display_num: Optional[int] = None
-    status: str = "pending"  # pending | active | done | failed
+    status: str = "pending"
+    start_time: Optional[float] = None
+    end_time: Optional[float] = None
 
 
 @dataclass
-class DAGState:
-    nodes: Dict[str, DAGNode] = field(default_factory=dict)
+class DAGPlan:
+    """The full execution plan: agents + signals."""
+    agents: Dict[str, AgentPlan] = field(default_factory=dict)
+    signals: Dict[str, Signal] = field(default_factory=dict)
     root_task: str = ""
-    max_depth: int = 3
     created_at: float = field(default_factory=time.time)
 
 
-class DAGScheduler:
-    """Scheduler with display-chain awareness.
+class Orchestrator:
+    """Signal/await orchestrator for parallel agent execution.
 
-    Sequential sub-nodes detected from dependency edges share a display.
-    Parallel sub-nodes get separate displays. Workers can expand nodes
-    into sub-DAGs that are merged back into the global DAG.
+    All agents start immediately on separate displays. Each agent runs
+    its phases sequentially, blocking only at await points where it
+    needs another agent's signal data.
     """
 
     def __init__(
         self,
-        dag_state: DAGState,
+        plan: DAGPlan,
         display_pool: DisplayPool,
         vm_exec: Callable[[str], Optional[dict]],
         bedrock_factory: Callable[[str, str], Any],
@@ -84,7 +98,7 @@ class DAGScheduler:
         task_timeout: float = 1200.0,
         password: str = "osworld-public-evaluation",
     ):
-        self.dag = dag_state
+        self.plan = plan
         self.display_pool = display_pool
         self.vm_exec = vm_exec
         self.bedrock_factory = bedrock_factory
@@ -96,450 +110,240 @@ class DAGScheduler:
         self.password = password
 
         self._lock = threading.RLock()
-        self._worker_threads: Dict[str, threading.Thread] = {}
+        self._signal_events: Dict[str, threading.Event] = {
+            name: threading.Event() for name in plan.signals
+        }
+        self._agent_threads: Dict[str, threading.Thread] = {}
         self._bedrock_clients: Dict[str, Any] = {}
-        self._chains: Dict[str, DisplayChain] = {}
         self._start_time: Optional[float] = None
-        self._event = threading.Event()
 
     def get_all_bedrock_clients(self) -> Dict[str, Any]:
         with self._lock:
             return dict(self._bedrock_clients)
 
     # ------------------------------------------------------------------
-    # Chain detection
+    # Signal operations
     # ------------------------------------------------------------------
 
-    def _detect_chains(self, node_ids: Set[str]):
-        """Detect sequential chains among a set of nodes and register them.
+    def set_signal(self, name: str, data: Dict[str, Any]):
+        with self._lock:
+            signal = self.plan.signals.get(name)
+            if not signal:
+                logger.error("Unknown signal: %s", name)
+                return
+            signal.data = data
+            signal.is_set = True
+            logger.info("Signal '%s' set by %s", name, signal.producer)
+        self._signal_events[name].set()
 
-        A chain is a maximal path where each node has exactly one internal
-        predecessor and one internal successor. Called after expansion.
-        """
-        successors: Dict[str, List[str]] = {nid: [] for nid in node_ids}
-        predecessors: Dict[str, List[str]] = {nid: [] for nid in node_ids}
+    def fail_signal(self, name: str, error: str):
+        with self._lock:
+            signal = self.plan.signals.get(name)
+            if not signal:
+                return
+            signal.failed = True
+            signal.error = error
+            logger.warning("Signal '%s' failed: %s", name, error)
+        self._signal_events[name].set()
 
-        for nid in node_ids:
-            node = self.dag.nodes.get(nid)
-            if not node:
-                continue
-            for dep in node.depends_on:
-                if dep in node_ids:
-                    predecessors[nid].append(dep)
-                    successors[dep].append(nid)
+    def wait_signal(self, name: str, timeout: Optional[float] = None) -> Optional[Dict[str, Any]]:
+        event = self._signal_events.get(name)
+        if not event:
+            logger.error("Unknown signal: %s", name)
+            return None
 
-        visited: Set[str] = set()
-        for nid in node_ids:
-            if nid in visited:
-                continue
-            if len(predecessors[nid]) != 0 and len(predecessors[nid]) != 1:
-                continue
-            if len(predecessors[nid]) == 1:
-                pred = predecessors[nid][0]
-                if len(successors[pred]) == 1:
-                    continue
+        event.wait(timeout=timeout)
 
-            chain = [nid]
-            visited.add(nid)
-            current = nid
-            while True:
-                succs = successors.get(current, [])
-                if len(succs) != 1:
-                    break
-                next_id = succs[0]
-                if len(predecessors.get(next_id, [])) != 1:
-                    break
-                if next_id in visited:
-                    break
-                chain.append(next_id)
-                visited.add(next_id)
-                current = next_id
+        with self._lock:
+            signal = self.plan.signals.get(name)
+            if not signal or signal.failed:
+                return None
+            return signal.data
 
-            if len(chain) >= 2:
-                chain_id = f"chain_{chain[0]}"
-                dc = DisplayChain(chain_id=chain_id, node_ids=chain)
-                self._chains[chain_id] = dc
-                for i, cid in enumerate(chain):
-                    cn = self.dag.nodes.get(cid)
-                    if cn:
-                        cn.chain_id = chain_id
-                        cn.chain_position = i
-                        cn.chain_successor = chain[i + 1] if i < len(chain) - 1 else None
-                logger.info("Detected chain %s: %s", chain_id, chain)
-
-    def _clear_chains_for_nodes(self, node_ids: Set[str]):
-        """Remove chain membership from nodes and delete empty chains."""
-        chains_to_check = set()
-        for nid in node_ids:
-            node = self.dag.nodes.get(nid)
-            if node and node.chain_id:
-                chains_to_check.add(node.chain_id)
-                node.chain_id = None
-                node.chain_position = 0
-                node.chain_successor = None
-        for cid in chains_to_check:
-            chain = self._chains.get(cid)
-            if chain:
-                chain.node_ids = [n for n in chain.node_ids if n not in node_ids]
-                if len(chain.node_ids) < 2:
-                    for remaining_id in chain.node_ids:
-                        rn = self.dag.nodes.get(remaining_id)
-                        if rn:
-                            rn.chain_id = None
-                            rn.chain_position = 0
-                            rn.chain_successor = None
-                    del self._chains[cid]
+    def is_signal_failed(self, name: str) -> bool:
+        with self._lock:
+            signal = self.plan.signals.get(name)
+            return signal.failed if signal else True
 
     # ------------------------------------------------------------------
-    # DAG queries
+    # Agent execution
     # ------------------------------------------------------------------
 
-    def _find_ready_nodes(self) -> List[DAGNode]:
-        ready = []
-        with self._lock:
-            for node in self.dag.nodes.values():
-                if node.status != "pending":
-                    continue
-                deps_met = all(
-                    self.dag.nodes[dep].status == "done"
-                    for dep in node.depends_on
-                    if dep in self.dag.nodes
-                )
-                if deps_met:
-                    ready.append(node)
-        return ready
-
-    def _is_complete(self) -> bool:
-        with self._lock:
-            return all(
-                n.status in ("done", "failed")
-                for n in self.dag.nodes.values()
-            )
-
-    def _gather_dependency_results(self, node: DAGNode) -> Dict[str, Any]:
-        results = {}
-        with self._lock:
-            for dep_id in node.depends_on:
-                dep = self.dag.nodes.get(dep_id)
-                if dep and dep.result:
-                    results[dep_id] = dep.result
-        return results
-
-    # ------------------------------------------------------------------
-    # Node assignment
-    # ------------------------------------------------------------------
-
-    def _assign_node(self, node: DAGNode) -> bool:
-        if node.chain_id and node.chain_position > 0:
-            return self._assign_chain_continuation(node)
-
-        display_num = self.display_pool.allocate(agent_id=f"worker_{node.id}")
-        if display_num is None:
-            return False
-
-        if node.setup_config:
-            executor = SetupExecutor(display_num=display_num, vm_exec=self.vm_exec)
-            setup_ok = executor.execute_config(node.setup_config)
-            if not setup_ok:
-                logger.warning("Setup failed for node %s on display :%d, proceeding", node.id, display_num)
-
-        if node.chain_id and node.chain_position == 0:
-            chain = self._chains.get(node.chain_id)
-            if chain:
-                chain.display_num = display_num
-                chain.status = "active"
-
-        self._start_worker(node, display_num)
-        return True
-
-    def _assign_chain_continuation(self, node: DAGNode) -> bool:
-        """Assign a chain-continuation node to the chain's existing display."""
-        chain = self._chains.get(node.chain_id)
-        if not chain or chain.display_num is None:
-            logger.error("Chain %s has no display for node %s", node.chain_id, node.id)
-            return False
-
-        self._start_worker(node, chain.display_num)
-        logger.info(
-            "Chain continuation: %s on display :%d (chain=%s pos=%d)",
-            node.id, chain.display_num, node.chain_id, node.chain_position,
-        )
-        return True
-
-    def _start_worker(self, node: DAGNode, display_num: int):
-        with self._lock:
-            node.status = "running"
-            node.display_num = display_num
-            node.agent_id = f"worker_{node.id}"
-            node.start_time = time.time()
-
-        worker_output = os.path.join(self.output_dir, node.agent_id)
-        os.makedirs(worker_output, exist_ok=True)
-
-        bedrock = self.bedrock_factory(worker_output, node.agent_id)
-        with self._lock:
-            self._bedrock_clients[node.agent_id] = bedrock
-
-        dep_results = self._gather_dependency_results(node)
-
-        thread = threading.Thread(
-            target=self._run_worker_thread,
-            args=(node, bedrock, worker_output, dep_results),
-            daemon=True,
-            name=f"worker-{node.id}",
-        )
-        with self._lock:
-            self._worker_threads[node.id] = thread
-        thread.start()
-
-        logger.info(
-            "Assigned %s to display :%d (depth=%d, chain=%s)",
-            node.id, display_num, node.depth, node.chain_id or "none",
-        )
-
-    def _run_worker_thread(self, node, bedrock, worker_output, dep_results):
+    def _run_agent_thread(self, agent: AgentPlan):
+        tag = f"[{agent.id}]"
         try:
-            from dag_worker import run_dag_worker
-            result = run_dag_worker(
-                node=node,
-                scheduler=self,
-                vm_ip=self.vm_ip,
-                server_port=self.server_port,
-                bedrock=bedrock,
-                model=self.model,
-                output_dir=worker_output,
-                password=self.password,
-                dependency_results=dep_results,
-            )
-            if result is not None:
-                if result.get("status") == "DONE":
-                    self._report_completion(node.id, result)
+            agent.status = "running"
+            agent.start_time = time.time()
+
+            if agent.setup and agent.display_num is not None:
+                executor = SetupExecutor(display_num=agent.display_num, vm_exec=self.vm_exec)
+                setup_ok = executor.execute_config(agent.setup)
+                if not setup_ok:
+                    logger.warning("%s Setup failed, proceeding anyway", tag)
+
+            agent_output = os.path.join(self.output_dir, agent.id)
+            os.makedirs(agent_output, exist_ok=True)
+            bedrock = self.bedrock_factory(agent_output, agent.id)
+            with self._lock:
+                self._bedrock_clients[agent.id] = bedrock
+
+            for i, phase in enumerate(agent.phases):
+                if self._start_time and (time.time() - self._start_time) > self.task_timeout:
+                    phase.status = "failed"
+                    phase.result = {"error": "task_timeout"}
+                    raise TimeoutError("Task timeout")
+
+                logger.info("%s Phase %d/%d: %s", tag, i + 1, len(agent.phases), phase.id)
+
+                # Await signals
+                signal_data: Dict[str, Any] = {}
+                if phase.awaits:
+                    phase.status = "blocked"
+                    logger.info("%s Awaiting signals: %s", tag, phase.awaits)
+
+                    for signal_name in phase.awaits:
+                        remaining = None
+                        if self._start_time:
+                            remaining = max(1.0, self.task_timeout - (time.time() - self._start_time))
+
+                        data = self.wait_signal(signal_name, timeout=remaining)
+
+                        if self.is_signal_failed(signal_name):
+                            phase.status = "failed"
+                            phase.result = {"error": f"Awaited signal '{signal_name}' failed"}
+                            raise RuntimeError(f"Signal '{signal_name}' failed")
+                        if data is None:
+                            phase.status = "failed"
+                            phase.result = {"error": f"Timeout waiting for signal '{signal_name}'"}
+                            raise TimeoutError(f"Signal '{signal_name}' timed out")
+
+                        signal_data[signal_name] = data
+
+                # Run CUA loop
+                phase.status = "running"
+                phase.start_time = time.time()
+
+                from dag_worker import run_phase
+                result = run_phase(
+                    agent=agent,
+                    phase=phase,
+                    phase_index=i,
+                    vm_ip=self.vm_ip,
+                    server_port=self.server_port,
+                    bedrock=bedrock,
+                    model=self.model,
+                    output_dir=agent_output,
+                    password=self.password,
+                    signal_data=signal_data if signal_data else None,
+                )
+
+                phase.end_time = time.time()
+                phase.result = result
+
+                if result.get("status") in ("DONE", "MAX_STEPS"):
+                    phase.status = "done"
+                    for signal_name in phase.signals:
+                        self.set_signal(signal_name, result)
                 else:
-                    self._report_failure(node.id, result.get("summary", "unknown"))
+                    phase.status = "failed"
+                    for signal_name in phase.signals:
+                        self.fail_signal(signal_name, f"Phase {phase.id} failed")
+                    raise RuntimeError(f"Phase {phase.id} failed: {result.get('summary', 'unknown')[:200]}")
+
+            agent.status = "done"
+            agent.end_time = time.time()
+            duration = agent.end_time - (agent.start_time or agent.end_time)
+            logger.info("%s Completed all %d phases (%.1fs)", tag, len(agent.phases), duration)
+
         except Exception as e:
-            logger.error("Worker %s crashed: %s", node.id, e, exc_info=True)
-            self._report_failure(node.id, str(e))
+            logger.error("%s Failed: %s", tag, e, exc_info=True)
+            agent.status = "failed"
+            agent.end_time = time.time()
+            for phase in agent.phases:
+                for signal_name in phase.signals:
+                    with self._lock:
+                        signal = self.plan.signals.get(signal_name)
+                        if signal and not signal.is_set:
+                            self.fail_signal(signal_name, str(e))
+
+        finally:
+            if agent.display_num is not None:
+                self.display_pool.release(agent.display_num)
 
     # ------------------------------------------------------------------
-    # Completion / failure
-    # ------------------------------------------------------------------
-
-    def _report_completion(self, node_id: str, result: Dict[str, Any]):
-        with self._lock:
-            node = self.dag.nodes.get(node_id)
-            if not node or node.status in ("done", "failed"):
-                return
-            node.status = "done"
-            node.result = result
-            duration = time.time() - (node.start_time or time.time())
-            logger.info("Node %s completed (%.1fs, depth=%d)", node_id, duration, node.depth)
-
-            should_release = True
-            if node.chain_id and node.chain_successor:
-                should_release = False
-                logger.info("Display :%d held for chain successor %s", node.display_num, node.chain_successor)
-            elif node.chain_id and not node.chain_successor:
-                chain = self._chains.get(node.chain_id)
-                if chain:
-                    chain.status = "done"
-
-            if should_release and node.display_num is not None and node.display_num > 0:
-                self.display_pool.release(node.display_num)
-
-        self._event.set()
-
-    def _report_failure(self, node_id: str, error: str):
-        with self._lock:
-            node = self.dag.nodes.get(node_id)
-            if not node or node.status in ("done", "failed"):
-                return
-            self._handle_failure_locked(node, error)
-            if node.display_num is not None and node.display_num > 0:
-                self.display_pool.release(node.display_num)
-            if node.chain_id:
-                chain = self._chains.get(node.chain_id)
-                if chain:
-                    chain.status = "failed"
-        self._event.set()
-
-    def _handle_failure_locked(self, node: DAGNode, error: str):
-        if node.retry_count < node.max_retries and error != "cascade":
-            node.retry_count += 1
-            node.status = "pending"
-            if node.display_num is not None and node.display_num > 0:
-                self.display_pool.release(node.display_num)
-            node.display_num = None
-            node.agent_id = None
-            node.start_time = None
-            logger.info("Node %s retrying (%d/%d)", node.id, node.retry_count, node.max_retries)
-            return
-
-        node.status = "failed"
-        node.result = {"error": error}
-        logger.error("Node %s failed: %s", node.id, error[:200])
-
-        for other in self.dag.nodes.values():
-            if node.id in other.depends_on and other.status == "pending":
-                self._handle_failure_locked(other, "cascade")
-
-    def _check_timeouts(self):
-        now = time.time()
-        with self._lock:
-            for node in self.dag.nodes.values():
-                if node.status == "running" and node.start_time:
-                    if (now - node.start_time) > node.timeout_seconds:
-                        logger.warning("Node %s timed out", node.id)
-                        self._handle_failure_locked(node, "timeout")
-
-    # ------------------------------------------------------------------
-    # Expansion (spec §4)
-    # ------------------------------------------------------------------
-
-    def report_expansion(self, node_id: str, sub_dag_plan: List[Dict[str, Any]]):
-        """Worker reports a node expansion. Merges sub-DAG, detects chains."""
-        with self._lock:
-            node = self.dag.nodes.get(node_id)
-            if not node:
-                return
-            parent_display = node.display_num
-
-            old_chain_id = node.chain_id
-            if old_chain_id:
-                self._clear_chains_for_nodes({node.id})
-
-            logger.info("Expanding %s into %d sub-nodes (depth %d->%d)",
-                        node_id, len(sub_dag_plan), node.depth, node.depth + 1)
-
-            new_node_ids = self._expand_node(node, sub_dag_plan)
-
-            self._detect_chains(new_node_ids)
-
-            if parent_display is not None and parent_display > 0:
-                inherited = False
-                entry_chain_ids = set()
-                for nid in new_node_ids:
-                    n = self.dag.nodes.get(nid)
-                    if n and n.chain_id and n.chain_position == 0:
-                        entry_chain_ids.add(n.chain_id)
-                    elif n and not n.chain_id:
-                        has_internal_dep = any(d in new_node_ids for d in n.depends_on)
-                        if not has_internal_dep:
-                            entry_chain_ids.add(f"standalone_{nid}")
-
-                if len(entry_chain_ids) == 1:
-                    ecid = entry_chain_ids.pop()
-                    chain = self._chains.get(ecid)
-                    if chain:
-                        chain.display_num = parent_display
-                        chain.status = "active"
-                        inherited = True
-                        logger.info("Display :%d inherited by chain %s", parent_display, ecid)
-
-                if not inherited:
-                    self.display_pool.release(parent_display)
-
-        self._event.set()
-
-    def _expand_node(self, node: DAGNode, sub_dag_plan: List[Dict[str, Any]]) -> Set[str]:
-        """Replace node with sub-DAG. Returns set of new node IDs. Lock must be held."""
-        sub_nodes = []
-        for step in sub_dag_plan:
-            sub_id = f"{node.id}__{step['id']}"
-            internal_deps = [f"{node.id}__{d}" for d in step.get("depends_on", [])]
-            sub_node = DAGNode(
-                id=sub_id,
-                task_description=step["task"],
-                depends_on=internal_deps,
-                status="pending",
-                parent_node_id=node.id,
-                depth=node.depth + 1,
-                setup_config=step.get("setup", []),
-                max_steps=step.get("max_steps", node.max_steps),
-                timeout_seconds=node.timeout_seconds,
-                max_retries=node.max_retries,
-            )
-            sub_nodes.append(sub_node)
-
-        all_sub_ids = {sn.id for sn in sub_nodes}
-
-        for sn in sub_nodes:
-            has_internal_deps = any(d in all_sub_ids for d in sn.depends_on)
-            if not has_internal_deps:
-                sn.depends_on = list(node.depends_on)
-
-        depended_on_internally = set()
-        for sn in sub_nodes:
-            depended_on_internally.update(d for d in sn.depends_on if d in all_sub_ids)
-        terminal_ids = list(all_sub_ids - depended_on_internally)
-
-        for other in self.dag.nodes.values():
-            if node.id in other.depends_on:
-                other.depends_on.remove(node.id)
-                other.depends_on.extend(terminal_ids)
-
-        for sn in sub_nodes:
-            self.dag.nodes[sn.id] = sn
-        del self.dag.nodes[node.id]
-
-        logger.info("Expanded %s -> %d nodes (terminals: %s)", node.id, len(sub_nodes), terminal_ids)
-        return all_sub_ids
-
-    # ------------------------------------------------------------------
-    # Main loop
+    # Main entry point
     # ------------------------------------------------------------------
 
     def run(self) -> Dict[str, Any]:
         self._start_time = time.time()
-        logger.info("DAG Scheduler starting: %d nodes, max_depth=%d",
-                     len(self.dag.nodes), self.dag.max_depth)
+        num_agents = len(self.plan.agents)
+        logger.info("Orchestrator starting: %d agents, %d signals",
+                     num_agents, len(self.plan.signals))
 
-        while not self._is_complete():
-            if time.time() - self._start_time > self.task_timeout:
-                logger.warning("Task timeout")
-                with self._lock:
-                    for n in self.dag.nodes.values():
-                        if n.status in ("pending", "running"):
-                            n.status = "failed"
-                            n.result = {"error": "task_timeout"}
-                break
+        for agent in self.plan.agents.values():
+            display_num = self.display_pool.allocate(agent_id=agent.id)
+            if display_num is None:
+                logger.error("No display available for agent %s", agent.id)
+                agent.status = "failed"
+                for phase in agent.phases:
+                    for sig in phase.signals:
+                        self.fail_signal(sig, "no display available")
+                continue
 
-            self._check_timeouts()
+            agent.display_num = display_num
+            thread = threading.Thread(
+                target=self._run_agent_thread,
+                args=(agent,),
+                daemon=True,
+                name=f"agent-{agent.id}",
+            )
+            self._agent_threads[agent.id] = thread
+            thread.start()
+            logger.info("Started agent %s on display :%d", agent.id, display_num)
 
-            ready = self._find_ready_nodes()
-            assigned_any = False
-            for node in ready:
-                if self._assign_node(node):
-                    assigned_any = True
-
-            if not assigned_any:
-                self._event.wait(timeout=0.5)
-                self._event.clear()
+        for agent_id, thread in self._agent_threads.items():
+            remaining = max(1.0, self.task_timeout - (time.time() - self._start_time))
+            thread.join(timeout=remaining)
+            if thread.is_alive():
+                logger.warning("Agent %s still running after timeout", agent_id)
+                self.plan.agents[agent_id].status = "failed"
 
         duration = time.time() - self._start_time
-        with self._lock:
-            all_done = all(n.status == "done" for n in self.dag.nodes.values())
-            node_summaries = {}
-            for n in self.dag.nodes.values():
-                summary = n.result.get("summary", "") if n.result else ""
-                node_summaries[n.id] = {
-                    "status": n.status,
-                    "depth": n.depth,
-                    "summary": summary[:500] if summary else "",
-                }
-
+        all_done = all(a.status == "done" for a in self.plan.agents.values())
         overall_status = "DONE" if all_done else "FAIL"
-        logger.info("DAG Scheduler finished: %s (%.1fs, %d nodes)",
-                     overall_status, duration, len(self.dag.nodes))
+
+        agent_summaries = {}
+        for agent in self.plan.agents.values():
+            phase_summaries = []
+            for phase in agent.phases:
+                summary = ""
+                if phase.result:
+                    summary = phase.result.get("summary", "")[:300]
+                phase_summaries.append({
+                    "id": phase.id,
+                    "status": phase.status,
+                    "summary": summary,
+                })
+            agent_summaries[agent.id] = {
+                "status": agent.status,
+                "phases": phase_summaries,
+                "display_num": agent.display_num,
+            }
+
+        logger.info("Orchestrator finished: %s (%.1fs, %d agents)",
+                     overall_status, duration, num_agents)
 
         return {
             "status": overall_status,
             "duration": duration,
-            "nodes": node_summaries,
-            "summary": self._build_final_summary(node_summaries),
+            "agents": agent_summaries,
+            "summary": self._build_summary(agent_summaries),
         }
 
-    def _build_final_summary(self, node_summaries: Dict[str, Any]) -> str:
+    def _build_summary(self, agent_summaries: Dict[str, Any]) -> str:
         parts = []
-        for nid, info in sorted(node_summaries.items()):
-            parts.append(f"[{nid}] {info['status']}: {info.get('summary', '')[:200]}")
+        for agent_id, info in sorted(agent_summaries.items()):
+            parts.append(f"[{agent_id}] {info['status']}")
+            for phase in info.get("phases", []):
+                parts.append(f"  {phase['id']}: {phase['status']} - {phase.get('summary', '')[:150]}")
         return "\n".join(parts)
