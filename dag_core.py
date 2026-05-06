@@ -131,9 +131,12 @@ _MANAGER_PROMPT = """\
 You are managing a computer-use worker agent. You watch every step it takes \
 and decide when to intervene.
 
-Overall goal (for context): {root_task}
+Overall goal: {root_task}
 
-Your worker's assigned task (your scope — only spawn helpers for work within this): {agent_task}
+Other agents working on this task (handled by their own managers — NOT your scope):
+{sibling_agents}
+
+Your worker's assigned task: {agent_task}
 Current phase: {phase_task}
 Free displays available for helpers: {idle_displays}
 
@@ -165,14 +168,15 @@ pace_notes: <observations about speed or struggles>
 CONTINUE — worker is on track, no intervention needed
 
 SPAWN_HELPER — there is separable work WITHIN THIS WORKER'S TASK that a \
-helper could do in parallel on a separate display. Only for work not already \
-covered by a spawned helper above. The helper should handle a portion of \
-THIS worker's task, not another agent's task.
+helper could do in parallel. Do NOT spawn helpers for work assigned to the \
+other agents listed above — their managers handle that. Do NOT duplicate \
+helpers already spawned above.
 helper_task: <specific, self-contained subtask>
 helper_setup: <"none" or a JSON setup action>
 message_to_worker: <tell worker what to skip since helper handles it>
 
-NUDGE — worker is stuck or going off track
+NUDGE — worker is going off track, stuck, or doing work that belongs to \
+another agent. If the worker is doing another agent's job, tell it to stop.
 message_to_worker: <guidance or course correction>"""
 
 
@@ -195,6 +199,7 @@ class Manager:
         orchestrator: "Orchestrator",
         bedrock: Any,
         model: str,
+        sibling_agents: Optional[List[AgentPlan]] = None,
     ):
         self.agent = agent
         self.orchestrator = orchestrator
@@ -203,6 +208,7 @@ class Manager:
         self._last_step_seen = 0
         self._assessment = "(no assessment yet — worker just started)"
         self._helpers_spawned: List[str] = []
+        self._sibling_info = self._format_siblings(sibling_agents or [])
 
     def run(self):
         """Main loop: watch for new steps, evaluate, intervene."""
@@ -235,6 +241,15 @@ class Manager:
             if phase.status == "running":
                 return phase
         return None
+
+    @staticmethod
+    def _format_siblings(siblings: List[AgentPlan]) -> str:
+        if not siblings:
+            return "(none — this is the only agent)"
+        lines = []
+        for s in siblings:
+            lines.append(f"  - {s.id}: {s.task}")
+        return "\n".join(lines)
 
     def _format_new_steps(self, new_steps: List[StepRecord]) -> str:
         lines = []
@@ -269,6 +284,7 @@ class Manager:
 
         prompt = _MANAGER_PROMPT.format(
             root_task=self.orchestrator.plan.root_task[:500],
+            sibling_agents=self._sibling_info,
             agent_task=self.agent.task[:300],
             phase_task=phase.task[:300],
             idle_displays=effective_idle,
@@ -556,7 +572,8 @@ class Orchestrator:
             with self._lock:
                 self._bedrock_clients[f"mgr_{agent.id}"] = manager_bedrock
 
-            manager = Manager(agent, self, manager_bedrock, self.model)
+            siblings = [a for a in self.plan.agents.values() if a.id != agent.id]
+            manager = Manager(agent, self, manager_bedrock, self.model, sibling_agents=siblings)
             manager_thread = threading.Thread(
                 target=manager.run, daemon=True, name=f"mgr-{agent.id}",
             )
