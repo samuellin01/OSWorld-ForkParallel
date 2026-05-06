@@ -113,8 +113,6 @@ def parse_args() -> argparse.Namespace:
 
     # Agent / model config
     parser.add_argument("--model", type=str, default="claude-opus-4-6")
-    parser.add_argument("--max_steps", type=int, default=100,
-                        help="Max steps per agent (default: 100).")
     parser.add_argument("--num_displays", type=int, default=8,
                         help="Number of virtual displays (default: 8).")
     parser.add_argument("--temperature", type=float, default=0.7)
@@ -412,7 +410,6 @@ def build_run_cmd(task_id: str, trial_base_dir: str, args: argparse.Namespace) -
         "--provider-name", args.provider_name,
         "--region", args.region,
         "--model", args.model,
-        "--max-steps", str(args.max_steps),
         "--output-dir", trial_base_dir,
     ]
     if args.headless:
