@@ -176,7 +176,9 @@ helper_setup: <"none" or a JSON setup action>
 message_to_worker: <tell worker what to skip since helper handles it>
 
 NUDGE — worker is going off track, stuck, or doing work that belongs to \
-another agent. If the worker is doing another agent's job, tell it to stop.
+another agent. If the worker is doing another agent's job, tell it to stop. \
+Do NOT provide task-specific data or answers yourself — only provide \
+coordination guidance (what to do, what to skip, how to proceed).
 message_to_worker: <guidance or course correction>"""
 
 
@@ -208,10 +210,11 @@ class Manager:
         self._last_step_seen = 0
         self._assessment = "(no assessment yet — worker just started)"
         self._helpers_spawned: List[str] = []
+        self._helper_ids: List[str] = []
         self._sibling_info = self._format_siblings(sibling_agents or [])
 
     def run(self):
-        """Main loop: watch for new steps, evaluate, intervene."""
+        """Main loop: watch steps, evaluate, then merge helper results if any."""
         tag = f"[mgr:{self.agent.id}]"
         logger.info("%s Manager started", tag)
 
@@ -233,6 +236,10 @@ class Manager:
                 self._evaluate(phase, new_steps, tag)
             except Exception as e:
                 logger.warning("%s Evaluation failed: %s", tag, e)
+
+        # Worker finished. If we spawned helpers, wait for them and merge results into deferred signals.
+        if self._helper_ids:
+            self._wait_and_merge(tag)
 
         logger.info("%s Manager finished (agent status: %s)", tag, self.agent.status)
 
@@ -363,8 +370,14 @@ class Manager:
 
                 if helper_task:
                     logger.info("%s SPAWN_HELPER: %s", tag, helper_task[:100])
+                    # Defer parent signals — we'll merge helper results before setting
+                    phase = self._current_running_phase()
+                    if phase:
+                        for sig in phase.signals:
+                            self.orchestrator.defer_signal(sig)
                     helper_id = self.orchestrator.spawn_helper(helper_task, helper_setup)
                     if helper_id:
+                        self._helper_ids.append(helper_id)
                         self._helpers_spawned.append(f"{helper_id}: {helper_task[:80]}")
                     if message:
                         self.orchestrator.send_message(self.agent.id, message)
@@ -386,6 +399,48 @@ class Manager:
 
         else:
             logger.info("%s No clear action in response", tag)
+
+    def _wait_and_merge(self, tag: str):
+        """Wait for all spawned helpers to finish, merge their results into deferred signals."""
+        logger.info("%s Waiting for %d helpers to finish...", tag, len(self._helper_ids))
+
+        deadline = time.time() + 600
+        for helper_id in self._helper_ids:
+            helper = self.orchestrator._helpers.get(helper_id)
+            if not helper:
+                continue
+            while helper.status not in ("done", "failed") and time.time() < deadline:
+                time.sleep(2)
+            logger.info("%s Helper %s finished: %s", tag, helper_id, helper.status)
+
+        # Merge: worker result + all helper results
+        worker_summary = ""
+        for phase in self.agent.phases:
+            if phase.result and phase.result.get("summary"):
+                worker_summary += phase.result["summary"]
+
+        helper_summaries = []
+        for helper_id in self._helper_ids:
+            helper = self.orchestrator._helpers.get(helper_id)
+            if helper and helper.status == "done":
+                for phase in helper.phases:
+                    if phase.result and phase.result.get("summary"):
+                        helper_summaries.append(phase.result["summary"])
+
+        merged_summary = worker_summary
+        if helper_summaries:
+            merged_summary += "\n\n--- Additional results from helper agents ---\n\n"
+            merged_summary += "\n\n".join(helper_summaries)
+
+        merged_result = {"status": "DONE", "summary": merged_summary}
+
+        # Set all deferred signals with merged data
+        for phase in self.agent.phases:
+            for signal_name in phase.signals:
+                if self.orchestrator.is_signal_deferred(signal_name):
+                    logger.info("%s Setting deferred signal '%s' with merged data (%d chars)",
+                                 tag, signal_name, len(merged_summary))
+                    self.orchestrator.set_signal(signal_name, merged_result)
 
 
 # ------------------------------------------------------------------
@@ -437,6 +492,7 @@ class Orchestrator:
 
         self._helpers: Dict[str, AgentPlan] = {}
         self._helper_count = 0
+        self._deferred_signals: Set[str] = set()
 
     def get_all_bedrock_clients(self) -> Dict[str, Any]:
         with self._lock:
@@ -490,6 +546,16 @@ class Orchestrator:
                 self.plan.signals[name] = Signal(name=name, producer=producer)
                 self._signal_events[name] = threading.Event()
                 logger.info("Registered dynamic signal '%s' (producer=%s)", name, producer)
+
+    def defer_signal(self, name: str):
+        """Mark a signal as deferred — the manager will set it after helpers finish."""
+        with self._lock:
+            self._deferred_signals.add(name)
+        logger.info("Signal '%s' deferred (manager will set after helper merge)", name)
+
+    def is_signal_deferred(self, name: str) -> bool:
+        with self._lock:
+            return name in self._deferred_signals
 
     # ------------------------------------------------------------------
     # Messaging
@@ -637,7 +703,8 @@ class Orchestrator:
                 if result.get("status") in ("DONE",):
                     phase.status = "done"
                     for signal_name in phase.signals:
-                        self.set_signal(signal_name, result)
+                        if not self.is_signal_deferred(signal_name):
+                            self.set_signal(signal_name, result)
                 else:
                     phase.status = "failed"
                     for signal_name in phase.signals:
