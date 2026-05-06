@@ -49,8 +49,7 @@ Output a JSON object with this structure:
           "id": "phase_name",
           "task": "What to do in this phase. Include ALL info the agent needs.",
           "awaits": ["signal_name"],
-          "signals": ["signal_name"],
-          "max_steps": 20
+          "signals": ["signal_name"]
         }}
       ]
     }}
@@ -129,9 +128,9 @@ def plan_dag(
         logger.info("  %s: %s (%d phases)",
                      agent["id"], agent["task"][:60], len(agent["phases"]))
         for phase in agent["phases"]:
-            logger.info("    %s: awaits=%s signals=%s max_steps=%d",
+            logger.info("    %s: awaits=%s signals=%s",
                          phase["id"], phase.get("awaits", []),
-                         phase.get("signals", []), phase.get("max_steps", 20))
+                         phase.get("signals", []))
     return plan
 
 
@@ -149,7 +148,6 @@ def convert_plan_to_dag(plan: Dict[str, Any], root_task: str) -> DAGPlan:
                 task=phase_data["task"],
                 awaits=phase_data.get("awaits", []),
                 signals=phase_data.get("signals", []),
-                max_steps=phase_data.get("max_steps", 20),
             )
             phases.append(phase)
 
@@ -178,7 +176,6 @@ def _single_agent_fallback(task_description: str) -> Dict[str, Any]:
                 "task": task_description,
                 "awaits": [],
                 "signals": [],
-                "max_steps": 30,
             }],
         }]
     }
@@ -225,7 +222,6 @@ def _validate_plan(plan: Dict[str, Any]):
                 "task": agent["task"],
                 "awaits": [],
                 "signals": [],
-                "max_steps": 30,
             }]
 
         for j, phase in enumerate(agent["phases"]):
@@ -237,8 +233,6 @@ def _validate_plan(plan: Dict[str, Any]):
                 phase["awaits"] = []
             if "signals" not in phase:
                 phase["signals"] = []
-            if "max_steps" not in phase:
-                phase["max_steps"] = 20
 
             all_produced.update(phase["signals"])
             all_awaited.update(phase["awaits"])
