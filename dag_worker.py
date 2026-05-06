@@ -1,15 +1,15 @@
-"""Per-phase CUA agent execution for the signal/await orchestrator.
+"""Per-phase CUA worker execution.
 
-Each agent runs its phases sequentially on the same display. A phase
-is a CUA loop (screenshot -> LLM -> action -> repeat) with two extra
-tools alongside computer-use:
+The worker is a pure screen executor. It has two tools:
+  - computer: interact with the screen
+  - await_signal: block mid-loop until another agent's data arrives
 
-  await_signal(name) — blocks mid-loop until another agent's data arrives.
-    The agent does independent work first, then calls this when it actually
-    needs the data. No artificial phase splitting required.
+The worker does NOT make parallelism decisions. Its manager (running
+in a separate thread) watches the step history and handles that.
 
-  request_help(task) — spawns a helper agent on a free display. The agent
-    continues its own work while the helper runs in parallel.
+No hard step limit. The worker runs until it says COMPLETE or FAILED.
+The task-level timeout is the hard wall. The manager can nudge the
+worker to wrap up via messages.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 import anthropic
 
 from agent_utils import COMPUTER_USE_TOOL, _resize_screenshot, parse_computer_use_actions
-from dag_core import AgentPlan, Phase, StepRecord, AWAIT_SIGNAL_TOOL, REQUEST_HELP_TOOL
+from dag_core import AgentPlan, Phase, StepRecord, AWAIT_SIGNAL_TOOL
 from fork_agent import XvfbDisplay
 
 if TYPE_CHECKING:
@@ -35,6 +35,9 @@ logger = logging.getLogger(__name__)
 
 _COMPLETION = re.compile(r'\b(PHASE\s+COMPLETE|SUBTASK\s+COMPLETE)\b', re.IGNORECASE)
 _FAILURE = re.compile(r'\b(PHASE\s+FAILED|SUBTASK\s+FAILED)\b', re.IGNORECASE)
+
+# Safety cap so a single phase can't loop forever if COMPLETE is never emitted
+_ABSOLUTE_MAX_STEPS = 200
 
 
 def run_phase(
@@ -58,7 +61,7 @@ def run_phase(
                                           has_orchestrator=orchestrator is not None)
     tools: List[Any] = [COMPUTER_USE_TOOL]
     if orchestrator:
-        tools.extend([AWAIT_SIGNAL_TOOL, REQUEST_HELP_TOOL])
+        tools.append(AWAIT_SIGNAL_TOOL)
 
     resize_factor = (1920.0 / 1280.0, 1080.0 / 720.0)
     is_continuation = phase_index > 0
@@ -86,9 +89,23 @@ def run_phase(
     pending_tool_results: List[Dict[str, Any]] = []
     final_response_text = ""
     start_time = time.time()
+    step = 0
 
-    for step in range(1, phase.max_steps + 1):
-        logger.info("%s Step %d/%d", tag, step, phase.max_steps)
+    while True:
+        step += 1
+
+        # Safety cap
+        if step > _ABSOLUTE_MAX_STEPS:
+            logger.warning("%s Absolute step cap (%d) reached", tag, _ABSOLUTE_MAX_STEPS)
+            break
+
+        # Task timeout check
+        if orchestrator and orchestrator._start_time:
+            if (time.time() - orchestrator._start_time) > orchestrator.task_timeout:
+                logger.warning("%s Task timeout reached", tag)
+                break
+
+        logger.info("%s Step %d", tag, step)
 
         shot = display.screenshot()
         step_timestamp = time.time()
@@ -102,16 +119,16 @@ def run_phase(
                 {"type": "text", "text": f"Step {step}: screenshot unavailable."},
             ]
 
-        # Prepend any pending tool results (from await_signal, request_help, or computer)
+        # Prepend pending tool results
         for tr in pending_tool_results:
             obs_content.insert(0, tr)
         pending_tool_results.clear()
 
-        # Inject orchestrator messages
+        # Inject manager/orchestrator messages
         if orchestrator:
             pending = orchestrator.get_pending_messages(agent.id)
             if pending:
-                msg_text = "\n".join(f"[ORCHESTRATOR]: {m}" for m in pending)
+                msg_text = "\n".join(f"[MANAGER]: {m}" for m in pending)
                 obs_content.append({"type": "text", "text": msg_text})
 
         messages.append({"role": "user", "content": obs_content})
@@ -145,14 +162,14 @@ def run_phase(
         logger.info("%s Response: %s", tag, response_text[:200])
         final_response_text = response_text
 
-        # Report progress to monitor
+        # Report progress (manager watches this)
         phase.current_step = step
         phase.latest_response = response_text
 
         with open(os.path.join(phase_output, f"step_{step:03d}_response.txt"), "w") as f:
             f.write(response_text)
 
-        # Process all tool calls
+        # Process tool calls
         step_action_summary = ""
         for block in content_blocks:
             if not isinstance(block, dict) or block.get("type") != "tool_use":
@@ -206,24 +223,6 @@ def run_phase(
                     "content": result_content,
                 })
 
-            elif tool_name == "request_help" and orchestrator:
-                helper_task = tool_input.get("task", "")
-                reason = tool_input.get("reason", "")
-                logger.info("%s request_help: %s (reason: %s)", tag, helper_task[:100], reason[:60])
-                step_action_summary = f"request_help({helper_task[:50]})"
-
-                helper_id = orchestrator.spawn_helper(helper_task)
-                if helper_id:
-                    result_content = f"Helper '{helper_id}' spawned on a separate display. It will work on: {helper_task}"
-                else:
-                    result_content = "No free displays available. You'll need to handle this yourself."
-
-                pending_tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": tool_id,
-                    "content": result_content,
-                })
-
             else:
                 pending_tool_results.append({
                     "type": "tool_result",
@@ -231,7 +230,7 @@ def run_phase(
                     "content": f"Unknown tool: {tool_name}",
                 })
 
-        # Record step in history for monitor
+        # Record step in history (manager reads this)
         if not step_action_summary:
             step_action_summary = response_text[:80].replace("\n", " ")
         phase.step_history.append(StepRecord(
@@ -261,11 +260,11 @@ def run_phase(
                     "duration": time.time() - start_time,
                 }
 
-    logger.warning("%s Max steps (%d) reached", tag, phase.max_steps)
+    logger.warning("%s Exited loop at step %d (timeout or cap)", tag, step)
     return {
-        "status": "MAX_STEPS",
-        "summary": f"Reached max steps. Last: {final_response_text}",
-        "steps_used": phase.max_steps,
+        "status": "FAIL",
+        "summary": f"Worker stopped at step {step}. Last: {final_response_text}",
+        "steps_used": step,
         "duration": time.time() - start_time,
     }
 
@@ -304,14 +303,13 @@ def _build_system_prompt(
 
     if has_orchestrator:
         prompt += (
-            "**COLLABORATION TOOLS** (use alongside the computer tool):\n"
+            "**COLLABORATION TOOL**:\n"
             "- `await_signal(signal_name)`: Block until data from another agent is ready. "
             "Do your independent setup work first (open apps, navigate), then call this "
-            "only when you actually need the data. Returns the data as the tool result.\n"
-            "- `request_help(task, reason)`: Spawn a helper agent on a separate display "
-            "to work in parallel. Use when you discover separable work — e.g., multiple "
-            "files to process, independent sections to write. The helper cannot see your "
-            "screen. Give it a specific, self-contained task.\n\n"
+            "only when you actually need the data. Returns the data as the tool result.\n\n"
+            "Your manager may send you messages during execution (shown as [MANAGER]: ...). "
+            "Follow their instructions — they have visibility into the overall task and may "
+            "tell you to skip certain work because a helper agent is handling it.\n\n"
         )
 
     if signal_data:
