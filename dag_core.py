@@ -5,18 +5,16 @@ Architecture:
   - Each agent runs phases sequentially on the same display
   - Cross-agent data flows through named signals (signal/await)
   - All agents start immediately; they only block at await points
-  - Monitor thread peeks at agent progress and spawns helpers when needed
-  - Orchestrator can message workers to narrow their focus
+  - Workers can call await_signal mid-loop to block for data naturally
+  - Workers can call request_help to spawn parallel helpers at runtime
+  - Monitor thread peeks at step history and can also spawn helpers
 
-Example:
-  Agent A: [open chrome] → [search] → [extract] → signal("results")
-  Agent B: [open doc] → [navigate] → await("results") → [paste]
-
-  Agent B's first two actions run in parallel with Agent A.
-  B only blocks at the await point. Both agents start immediately.
-
-  If A is slow, the monitor spawns a helper and messages A:
-  "Helper is handling file 3, you focus on files 1-2."
+Example with worker tools:
+  reader:     open Desktop → see 3 files → request_help("read Test 3")
+              → read Test 1 → read Test 2 → COMPLETE
+  helper_1:   read Test 3 → COMPLETE
+  doc_writer: open Doc → navigate to end → await_signal("test2_answers")
+              → type answers → await_signal("test3_answers") → type → COMPLETE
 """
 
 from __future__ import annotations
@@ -27,13 +25,17 @@ import os
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from display_pool import DisplayPool
 from setup_executor import SetupExecutor
 
 logger = logging.getLogger(__name__)
 
+
+# ------------------------------------------------------------------
+# Data structures
+# ------------------------------------------------------------------
 
 @dataclass
 class Signal:
@@ -44,6 +46,15 @@ class Signal:
     is_set: bool = False
     failed: bool = False
     error: Optional[str] = None
+
+
+@dataclass
+class StepRecord:
+    """One step of an agent's execution, for monitor visibility."""
+    step_num: int
+    timestamp: float
+    elapsed: float
+    action_summary: str
 
 
 @dataclass
@@ -60,6 +71,7 @@ class Phase:
     end_time: Optional[float] = None
     current_step: int = 0
     latest_response: str = ""
+    step_history: List[StepRecord] = field(default_factory=list)
 
 
 @dataclass
@@ -84,6 +96,10 @@ class DAGPlan:
     created_at: float = field(default_factory=time.time)
 
 
+# ------------------------------------------------------------------
+# Monitor prompt
+# ------------------------------------------------------------------
+
 _MONITOR_PROMPT = """\
 You are monitoring a computer-use agent working on a task.
 
@@ -92,6 +108,11 @@ Agent: {agent_id} — {agent_task}
 Current phase: {phase_task}
 Progress: step {current_step} of {max_steps} ({pct_used:.0f}% of budget used)
 Elapsed: {elapsed:.0f}s
+Avg time per step: {avg_step_time:.1f}s
+At current pace, steps will be exhausted in: {time_remaining_est:.0f}s
+
+Step history (action taken at each step):
+{step_history}
 
 Agent's latest output:
 {latest_response}
@@ -102,6 +123,7 @@ Should we spawn a helper agent to take over part of this agent's remaining work?
 
 Only recommend this if:
 - There is clearly separable remaining work (e.g., unprocessed files, unwritten sections)
+- The step history shows the agent is working through items sequentially that could be parallelized
 - The agent is unlikely to finish everything within its remaining step budget
 - A helper can work independently on a separate display without conflicting
 
@@ -115,13 +137,65 @@ If NO, respond with just:
 CONTINUE"""
 
 
-class Orchestrator:
-    """Signal/await orchestrator with runtime monitoring and replanning.
+# ------------------------------------------------------------------
+# Worker tool schemas (alongside the computer-use tool)
+# ------------------------------------------------------------------
 
-    All agents start immediately on separate displays. The monitor thread
-    periodically peeks at agent progress and can:
-      - Spawn helper agents on free displays for separable remaining work
-      - Message workers to narrow their focus
+AWAIT_SIGNAL_TOOL = {
+    "name": "await_signal",
+    "description": (
+        "Block until data from another agent is ready, then return it. "
+        "Use this when you need results from a parallel agent before continuing. "
+        "You can do independent setup work first, then call this when you actually need the data. "
+        "The call will block until the data is available."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "signal_name": {
+                "type": "string",
+                "description": "Name of the signal to wait for (from the task description).",
+            },
+        },
+        "required": ["signal_name"],
+    },
+}
+
+REQUEST_HELP_TOOL = {
+    "name": "request_help",
+    "description": (
+        "Ask the orchestrator to spawn a helper agent on a separate display to work "
+        "on a subtask in parallel. Use this when you discover work that can be done "
+        "independently — e.g., you see 3 files to process and want another agent to "
+        "handle some of them. The helper runs on its own screen and cannot see yours. "
+        "Give a specific, self-contained task description."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "task": {
+                "type": "string",
+                "description": "Specific, self-contained task for the helper agent.",
+            },
+            "reason": {
+                "type": "string",
+                "description": "Brief reason why this should be parallelized.",
+            },
+        },
+        "required": ["task"],
+    },
+}
+
+
+class Orchestrator:
+    """Signal/await orchestrator with worker tools and runtime monitoring.
+
+    Workers get two tools alongside computer-use:
+      - await_signal: block mid-CUA-loop for another agent's data
+      - request_help: spawn a helper agent on a free display
+
+    The monitor thread also peeks at step history and can spawn helpers
+    or message workers when it detects bottlenecks.
     """
 
     def __init__(
@@ -214,20 +288,65 @@ class Orchestrator:
             signal = self.plan.signals.get(name)
             return signal.failed if signal else True
 
+    def register_signal(self, name: str, producer: str):
+        """Register a new signal at runtime (for dynamic helpers)."""
+        with self._lock:
+            if name not in self.plan.signals:
+                self.plan.signals[name] = Signal(name=name, producer=producer)
+                self._signal_events[name] = threading.Event()
+                logger.info("Registered dynamic signal '%s' (producer=%s)", name, producer)
+
     # ------------------------------------------------------------------
     # Messaging: orchestrator -> worker
     # ------------------------------------------------------------------
 
     def send_message(self, agent_id: str, message: str):
-        """Send a message to a running agent. Injected into its next CUA observation."""
         with self._lock:
             self._agent_messages.setdefault(agent_id, []).append(message)
         logger.info("Message -> %s: %s", agent_id, message[:120])
 
     def get_pending_messages(self, agent_id: str) -> List[str]:
-        """Called by the worker to pick up orchestrator messages."""
         with self._lock:
             return self._agent_messages.pop(agent_id, [])
+
+    # ------------------------------------------------------------------
+    # Helper spawning (used by both monitor and request_help tool)
+    # ------------------------------------------------------------------
+
+    def spawn_helper(self, task: str, setup: Optional[List[Dict[str, Any]]] = None) -> Optional[str]:
+        """Spawn a helper agent. Returns helper_id or None if no display available."""
+        self._helper_count += 1
+        helper_id = f"helper_{self._helper_count}"
+
+        helper = AgentPlan(
+            id=helper_id,
+            task=task,
+            phases=[Phase(id="execute", task=task, max_steps=25)],
+            setup=setup or [],
+        )
+
+        display_num = self.display_pool.allocate(agent_id=helper_id)
+        if display_num is None:
+            logger.warning("No display available for helper %s", helper_id)
+            return None
+
+        helper.display_num = display_num
+
+        with self._lock:
+            self._helpers[helper_id] = helper
+
+        thread = threading.Thread(
+            target=self._run_agent_thread,
+            args=(helper,),
+            daemon=True,
+            name=f"agent-{helper_id}",
+        )
+        with self._lock:
+            self._agent_threads[helper_id] = thread
+        thread.start()
+
+        logger.info("Spawned helper %s on display :%d — %s", helper_id, display_num, task[:80])
+        return helper_id
 
     # ------------------------------------------------------------------
     # Agent execution
@@ -259,7 +378,7 @@ class Orchestrator:
 
                 logger.info("%s Phase %d/%d: %s", tag, i + 1, len(agent.phases), phase.id)
 
-                # Await signals
+                # Await signals (phase-level, before loop starts)
                 signal_data: Dict[str, Any] = {}
                 if phase.awaits:
                     phase.status = "blocked"
@@ -336,7 +455,7 @@ class Orchestrator:
                 self.display_pool.release(agent.display_num)
 
     # ------------------------------------------------------------------
-    # Monitor: peek at progress, spawn helpers, message workers
+    # Monitor: peek at step history, spawn helpers, message workers
     # ------------------------------------------------------------------
 
     def _start_monitor(self):
@@ -382,7 +501,6 @@ class Orchestrator:
             if not phase:
                 continue
 
-            # Only evaluate once the agent has used enough of its budget to judge
             if phase.current_step < max(5, phase.max_steps * 0.4):
                 continue
 
@@ -392,9 +510,21 @@ class Orchestrator:
 
             self._evaluate_and_maybe_replan(agent, phase, idle_count)
 
+    def _format_step_history(self, phase: Phase) -> str:
+        if not phase.step_history:
+            return "(no steps recorded)"
+        lines = []
+        for rec in phase.step_history:
+            lines.append(f"  step {rec.step_num} (+{rec.elapsed:.0f}s): {rec.action_summary}")
+        return "\n".join(lines)
+
     def _evaluate_and_maybe_replan(self, agent: AgentPlan, phase: Phase, idle_displays: int):
         elapsed = time.time() - (phase.start_time or time.time())
         pct_used = (phase.current_step / phase.max_steps) * 100 if phase.max_steps > 0 else 0
+
+        avg_step_time = elapsed / phase.current_step if phase.current_step > 0 else 0
+        steps_remaining = phase.max_steps - phase.current_step
+        time_remaining_est = steps_remaining * avg_step_time
 
         prompt = _MONITOR_PROMPT.format(
             root_task=self.plan.root_task[:500],
@@ -405,14 +535,17 @@ class Orchestrator:
             max_steps=phase.max_steps,
             pct_used=pct_used,
             elapsed=elapsed,
+            avg_step_time=avg_step_time,
+            time_remaining_est=time_remaining_est,
+            step_history=self._format_step_history(phase),
             latest_response=phase.latest_response[:2000],
             idle_displays=idle_displays,
         )
 
         messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
 
-        logger.info("Monitor evaluating %s/%s (step %d/%d, %.0fs elapsed)",
-                     agent.id, phase.id, phase.current_step, phase.max_steps, elapsed)
+        logger.info("Monitor evaluating %s/%s (step %d/%d, %.0fs elapsed, %.1fs/step)",
+                     agent.id, phase.id, phase.current_step, phase.max_steps, elapsed, avg_step_time)
 
         try:
             content_blocks, _ = self._monitor_bedrock.chat(
@@ -435,7 +568,6 @@ class Orchestrator:
             logger.info("Monitor: %s/%s — CONTINUE", agent.id, phase.id)
             return
 
-        # Parse replan response
         helper_task = ""
         helper_setup: List[Dict[str, Any]] = []
         message_to_agent = ""
@@ -456,7 +588,7 @@ class Orchestrator:
                 message_to_agent = line[len("message_to_agent:"):].strip()
 
         if not helper_task:
-            logger.warning("Monitor: REPLAN response but no helper_task parsed")
+            logger.warning("Monitor: REPLAN but no helper_task parsed")
             return
 
         logger.info("Monitor: REPLAN for %s/%s", agent.id, phase.id)
@@ -464,44 +596,10 @@ class Orchestrator:
         logger.info("  Message: %s", message_to_agent[:120])
 
         self._replanned_agents.add(agent.id)
-
-        self._spawn_helper(helper_task, helper_setup)
+        self.spawn_helper(helper_task, helper_setup)
 
         if message_to_agent:
             self.send_message(agent.id, message_to_agent)
-
-    def _spawn_helper(self, task: str, setup: List[Dict[str, Any]]):
-        self._helper_count += 1
-        helper_id = f"helper_{self._helper_count}"
-
-        helper = AgentPlan(
-            id=helper_id,
-            task=task,
-            phases=[Phase(id="execute", task=task, max_steps=25)],
-            setup=setup,
-        )
-
-        display_num = self.display_pool.allocate(agent_id=helper_id)
-        if display_num is None:
-            logger.warning("No display available for helper %s", helper_id)
-            return
-
-        helper.display_num = display_num
-
-        with self._lock:
-            self._helpers[helper_id] = helper
-
-        thread = threading.Thread(
-            target=self._run_agent_thread,
-            args=(helper,),
-            daemon=True,
-            name=f"agent-{helper_id}",
-        )
-        with self._lock:
-            self._agent_threads[helper_id] = thread
-        thread.start()
-
-        logger.info("Spawned helper %s on display :%d — %s", helper_id, display_num, task[:80])
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -536,7 +634,6 @@ class Orchestrator:
 
         self._start_monitor()
 
-        # Wait for all threads (including dynamically spawned helpers)
         deadline = self._start_time + self.task_timeout
         while time.time() < deadline:
             with self._lock:
@@ -551,7 +648,6 @@ class Orchestrator:
             if all_done:
                 break
 
-        # Mark timed-out agents
         duration = time.time() - self._start_time
         all_agents = list(self.plan.agents.values()) + list(self._helpers.values())
         for agent in all_agents:
