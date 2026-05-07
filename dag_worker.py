@@ -57,8 +57,10 @@ def run_phase(
     tag = f"[{agent.id}/{phase.id}]"
     display_num = agent.display_num or 0
     display = XvfbDisplay(vm_ip, server_port, display_num)
+    available_signals = list(orchestrator.plan.signals.keys()) if orchestrator else None
     system_prompt = _build_system_prompt(agent, phase, phase_index, password, signal_data,
-                                          has_orchestrator=orchestrator is not None)
+                                          has_orchestrator=orchestrator is not None,
+                                          available_signals=available_signals)
     tools: List[Any] = [COMPUTER_USE_TOOL]
     if orchestrator:
         tools.append(AWAIT_SIGNAL_TOOL)
@@ -280,6 +282,7 @@ def _build_system_prompt(
     password: str,
     signal_data: Optional[Dict[str, Any]],
     has_orchestrator: bool = False,
+    available_signals: Optional[List[str]] = None,
 ) -> str:
     display_num = agent.display_num or 0
     chrome_port = 1337 + display_num
@@ -310,8 +313,12 @@ def _build_system_prompt(
             "**COLLABORATION TOOL**:\n"
             "- `await_signal(signal_name)`: Block until data from another agent is ready. "
             "Do your independent setup work first (open apps, navigate), then call this "
-            "only when you actually need the data. Returns the data as the tool result.\n\n"
-            "Your manager may send you messages during execution (shown as [MANAGER]: ...). "
+            "only when you actually need the data. Returns the data as the tool result.\n"
+        )
+        if available_signals:
+            prompt += f"\n  Available signals you can await: {', '.join(available_signals)}\n"
+        prompt += (
+            "\nYour manager may send you messages during execution (shown as [MANAGER]: ...). "
             "Follow their instructions — they have visibility into the overall task and may "
             "tell you to skip certain work because a helper agent is handling it.\n\n"
         )
